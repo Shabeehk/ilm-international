@@ -5,6 +5,8 @@
   var WHATSAPP_NUMBER = '905518881481';      // +90 551 888 14 81 (no + or spaces)
   var LEAD_KEY = 'ilm_lead_v1';
   var POPUP_DELAY_MS = 1500;
+  // Lead-saving service (Cloudflare Worker). Works from Firebase or Cloudflare.
+  var LEAD_API = 'https://ilm-international.shabeehminnath.workers.dev/api/lead';
 
   var PLANS = {
     weekend:  { name: 'Weekend Class',        price: '$80',  detail: '2 classes a week on weekends, 2 hours' },
@@ -128,11 +130,10 @@
 
       var done = function () { location.href = 'fees.html'; };
       var timer = setTimeout(done, 4000);
-      fetch('/api/lead', {
+      fetch(LEAD_API, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(lead),
-        keepalive: true
+        headers: { 'Content-Type': 'text/plain;charset=UTF-8' }, // simple request: no CORS preflight needed
+        body: JSON.stringify(lead)
       }).catch(function () {}).finally(function () { clearTimeout(timer); done(); });
     });
   });
