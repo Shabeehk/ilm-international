@@ -3,10 +3,18 @@
 //           GET  /api/leads?key=ADMIN_KEY -> downloads all registrations as CSV
 // Everything else is served from the website files as normal.
 
+// The website on Firebase (ilminternational.web.app) sends registrations here, so allow other sites to POST.
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Max-Age': '86400',
+};
+
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' },
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...CORS },
   });
 
 const clean = (value, max = 120) =>
@@ -87,13 +95,14 @@ export default {
     const { pathname } = new URL(request.url);
 
     if (pathname === '/api/lead') {
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
       return request.method === 'POST' ? saveLead(request, env) : json({ ok: false, error: 'Method not allowed' }, 405);
     }
     if (pathname === '/api/leads') {
       return request.method === 'GET' ? downloadLeads(request, env) : new Response('Method not allowed', { status: 405 });
     }
     // Keep the server files private
-    if (['/worker.js', '/wrangler.jsonc', '/README.txt'].includes(pathname)) {
+    if (['/worker.js', '/wrangler.jsonc', '/README.txt', '/firebase.json'].includes(pathname)) {
       return new Response('Not found', { status: 404 });
     }
     // Serve the website files (index.html, fees.html, images, styles…)
