@@ -263,3 +263,9 @@ p { margin: 0; }
 }
 
 .fee-hero .badge { align-self: center; }
+
+/* Real photos */
+img.photo { object-fit: cover; object-position: center 30%; }
+.stack .s2 img.photo { object-position: 60% 30%; }
+.modal-art img.photo { object-position: center 25%; }
+.plan-media img.photo { object-position: center 35%; }
