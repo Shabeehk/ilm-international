@@ -1,0 +1,13 @@
+{
+  // ILM International — Cloudflare Worker settings
+  "name": "ilm-international",
+  "main": "worker.js",
+  "compatibility_date": "2026-11-01",
+  "assets": {
+    "directory": ".",
+    "binding": "ASSETS",
+    "run_worker_first": true
+  },
+  // Cloudflare creates this storage automatically on the next deploy
+  "kv_namespaces": [{ "binding": "LEADS" }]
+}
