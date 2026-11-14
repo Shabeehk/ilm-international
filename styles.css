@@ -269,3 +269,8 @@ img.photo { object-fit: cover; object-position: center 30%; }
 .stack .s2 img.photo { object-position: 60% 30%; }
 .modal-art img.photo { object-position: center 25%; }
 .plan-media img.photo { object-position: center 35%; }
+
+/* link to the learning portal */
+.header-portal { font-weight: 700; color: var(--teal-dark); text-decoration: none; padding: 10px 6px; white-space: nowrap; }
+.header-portal:hover { text-decoration: underline; }
+@media (max-width: 760px) { .header-portal { display: none; } }

@@ -1,0 +1,174 @@
+ILM INTERNATIONAL — LEARNING PORTAL
+Setup guide (about 20 minutes)
+=====================================================================
+
+What you are setting up
+-----------------------
+  portal.html        the portal (students, teachers, admin, parents)
+  Supabase           the database (your OTHER Supabase account)
+  Cloudflare Worker  takes the Razorpay payments (same Worker as before)
+
+Menu names in Supabase, Cloudflare and Razorpay change from time to
+time. If a name below is slightly different on your screen, look for
+the closest match.
+
+
+PART 1 — THE DATABASE (Supabase)                              5 minutes
+---------------------------------------------------------------------
+1. Go to supabase.com and sign in with your OTHER email.
+   Open the project you want to use, or press "New project".
+
+2. In the left menu open "SQL Editor" and press "New query".
+
+3. Open the file  supabase-setup.sql , select everything, copy it,
+   paste it into the SQL Editor and press "Run".
+   You should see:  Success. No rows returned.
+   (It is safe to run this file again later. It never deletes data
+   and never overwrites lessons you have edited.)
+
+4. Turn off email confirmation, so teachers can sign in straight away:
+   Authentication > Sign In / Providers > Email
+   switch OFF "Confirm email" and Save.
+
+5. Authentication > URL Configuration > "Site URL":
+   https://ilminternational.web.app/portal.html
+   (This is where "forgot password" emails send people back to.)
+
+6. Project Settings > API Keys (or "API"). Copy these two values:
+     a) Project URL            looks like https://abcdxyz.supabase.co
+     b) Publishable key        starts with sb_publishable_...
+        (on older projects it is called "anon public")
+   These two are PUBLIC values and are safe to share.
+
+7. Open  portal-config.js  and replace the two placeholder values with
+   them. Or send the two values to Claude and ask for the finished file.
+
+   NEVER put the "secret" / "service_role" key in portal-config.js.
+
+
+PART 2 — PUT THE FILES ONLINE                                 5 minutes
+---------------------------------------------------------------------
+GitHub (Shabeehk/ilm-international) > Add file > Upload files.
+Upload ALL files from this folder and commit. GitHub replaces the old
+ones with the same name.
+
+  New files:      portal.html  portal.css  portal.js  portal-staff.js
+                  portal-config.js  supabase.js  supabase-setup.sql
+                  PORTAL-SETUP.txt
+  Changed files:  worker.js  index.html  fees.html  styles.css
+                  firebase.json
+
+Cloudflare rebuilds the Worker by itself after the commit.
+
+Firebase (this is the main address, ilminternational.web.app):
+copy the same files into the folder on your computer that you
+deployed from last time, open the Terminal in that folder and run:
+
+   npx firebase-tools deploy --only hosting --project ilminternational
+
+
+PART 3 — CREATE YOUR ADMIN ACCOUNT                            2 minutes
+---------------------------------------------------------------------
+Do this straight after Part 2.
+
+1. Open  https://ilminternational.web.app/portal.html
+2. Choose "Teacher / Admin" > "Create an account".
+3. Enter your name, email and a password you do not use anywhere else.
+
+The FIRST account ever created becomes the academy admin. Everyone who
+signs up after you is a teacher and waits for your approval.
+
+
+PART 4 — SWITCH ON RAZORPAY PAYMENTS                         10 minutes
+---------------------------------------------------------------------
+Until you finish this part everything else works; parents simply see
+"contact the academy" if they press Pay now.
+
+1. Razorpay Dashboard > Account & Settings > API Keys > Generate key.
+   Start in TEST MODE. You get a Key Id and a Key Secret.
+
+2. Your fees are in US dollars. Razorpay only charges foreign cards in
+   USD after "International Payments" is approved on your account
+   (Account & Settings > International payments). Until it is approved,
+   either keep using Test Mode, or change the currency to INR in the
+   portal under Settings.
+
+3. Check that payments are captured automatically
+   (Account & Settings > Payment capture > Automatic).
+
+4. In Supabase > Project Settings > API Keys copy the SECRET key
+   (starts with sb_secret_... ; on older projects "service_role").
+   This one is private. Do not share it and do not paste it in a chat.
+
+5. Cloudflare > Workers & Pages > ilm-international > Settings >
+   Variables and Secrets > Add. Add these four, each as type "Secret",
+   with the names typed EXACTLY like this:
+
+     RAZORPAY_KEY_ID        the Razorpay Key Id
+     RAZORPAY_KEY_SECRET    the Razorpay Key Secret
+     SUPABASE_URL           the Project URL from Part 1
+     SUPABASE_SERVICE_KEY   the Supabase SECRET key from step 4
+
+   Press Deploy.
+
+6. In the portal go to Settings > "Check payment setup".
+   It should say "Switched on".
+
+7. Test it: add a test student with your own WhatsApp number, create a
+   fee, open the parent link, press "Pay now" and pay with a Razorpay
+   test card. The fee should turn to "Paid" on the Fees page.
+
+8. When the test works, replace the two Razorpay secrets in Cloudflare
+   with your LIVE keys.
+
+9. Recommended safety net (marks the fee paid even if the parent closes
+   the page too early):
+   Razorpay > Developers > Webhooks > Add new webhook
+     URL:     https://ilm-international.shabeehminnath.workers.dev/api/pay/webhook
+     Secret:  make up a long password
+     Events:  payment.captured  and  order.paid
+   Then add that same password in Cloudflare as a fifth secret named
+     RAZORPAY_WEBHOOK_SECRET
+
+
+HOW TO USE IT DAY TO DAY
+---------------------------------------------------------------------
+Admin
+  Classes    create a class: level, teacher, timetable, Zoom/Meet link
+  Students   "Add student" creates the Student ID and PIN. One tap sends
+             them, with the private parent link, to the parent's WhatsApp
+  Teachers   teachers sign up themselves; you approve them here
+  Fees       each month press "Create fees for <month>". Press "Remind"
+             to send a WhatsApp reminder with the pay link. Online
+             payments turn to Paid by themselves; for bank or cash press
+             "Mark paid"
+  Syllabus   read, edit or add lessons and quiz questions
+  Settings   prices, currency, WhatsApp number, data downloads
+
+Teacher
+  Attendance, homework (set, read answers, give stars), and on each
+  student's page: assessment marks 1–5 with a note for the parent,
+  bonus stars, certificates, new PIN, parent link.
+  Teachers only see students in their own classes and never see fees.
+
+Student
+  Logs in with Student ID + 6-digit PIN. Reads short lessons, takes the
+  quiz after each one (can retry as often as they like), takes the unit
+  exam, hands in homework, collects stars, badges and certificates.
+
+Parent
+  Opens the private link. Sees progress, the teacher's marks and notes,
+  attendance, certificates, and any unpaid fee with a "Pay now" button.
+
+
+GOOD TO KNOW
+---------------------------------------------------------------------
+* A PIN is shown only once. If it is lost, press "New PIN".
+* After 6 wrong PINs a student login is locked for 10 minutes.
+* The parent link is private. Anyone who has it can see that child's
+  report, so send it only to the parent.
+* The lessons were written to be mainstream and age-appropriate. Please
+  have your teachers read them once and adjust anything to your
+  academy's teaching in Syllabus > Edit.
+* Free Supabase projects go to sleep after about a week without
+  visitors. Opening the project in Supabase wakes it up again.

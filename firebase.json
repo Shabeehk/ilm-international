@@ -6,11 +6,21 @@
       "worker.js",
       "wrangler.jsonc",
       "README.txt",
+      "PORTAL-SETUP.txt",
+      "supabase-setup.sql",
       "**/.*",
       "**/node_modules/**"
     ],
     "headers": [
-      { "source": "**/*.@(css|js|svg)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=3600" }] }
+      {
+        "source": "**/*.@(css|js|svg)",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=600"
+          }
+        ]
+      }
     ]
   }
 }
