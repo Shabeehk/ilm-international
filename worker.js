@@ -4,16 +4,21 @@
 //           POST /api/pay/order   -> starts a Razorpay payment for one fee
 //           POST /api/pay/verify  -> checks the payment and marks the fee as paid
 //           POST /api/pay/webhook -> Razorpay calls this too, as a safety net
+//           GET  /api/push/key    -> public key browsers need to switch on class reminders
+//           POST /api/push/test   -> sends one test reminder to the browser that asks
+//           every minute (cron)   -> reminds students, parents and teachers 10 minutes before a class
 // Everything else is served from the website files as normal.
 //
 // Secrets needed for payments (Cloudflare > Worker > Settings > Variables and Secrets):
 //   RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET, SUPABASE_URL, SUPABASE_SERVICE_KEY
 //   RAZORPAY_WEBHOOK_SECRET (optional, only if you add the webhook)
+// Class reminders only need SUPABASE_URL and SUPABASE_SERVICE_KEY, plus the cron
+// trigger in wrangler.jsonc. The signing key for reminders is made automatically.
 
 // The website on Firebase (ilminternational.web.app) sends registrations here, so allow other sites to POST.
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type',
   'Access-Control-Max-Age': '86400',
 };
@@ -211,6 +216,150 @@ async function payWebhook(request, env) {
   return json({ ok: true });
 }
 
+// ------------------------------------------------- class reminders (Web Push)
+const dbReady = (env) => env.SUPABASE_URL && env.SUPABASE_SERVICE_KEY;
+const b64u = (bytes) => btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = (s) => {
+  s = String(s || '').replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  return Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+};
+const join = (...parts) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+};
+
+// The signing key (VAPID) is created once and kept in the database, so it never changes.
+let vapidCache = null;
+async function vapidKeys(env) {
+  if (vapidCache) return vapidCache;
+  let v = await db(env, 'ilm_svc_vapid', { p_new: null });
+  if (!v || !v.jwk) {
+    const pair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify']);
+    const jwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
+    const pub = await crypto.subtle.exportKey('raw', pair.publicKey);
+    v = await db(env, 'ilm_svc_vapid', { p_new: { jwk, public: b64u(pub) } });
+  }
+  const key = await crypto.subtle.importKey('jwk', { kty: v.jwk.kty, crv: v.jwk.crv, x: v.jwk.x, y: v.jwk.y, d: v.jwk.d },
+    { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign']);
+  vapidCache = { key, public: v.public };
+  return vapidCache;
+}
+
+async function vapidHeader(endpoint, keys) {
+  const head = b64u(enc.encode(JSON.stringify({ typ: 'JWT', alg: 'ES256' })));
+  const body = b64u(enc.encode(JSON.stringify({
+    aud: new URL(endpoint).origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: 'https://ilminternational.web.app',
+  })));
+  const sig = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, keys.key, enc.encode(`${head}.${body}`));
+  return `vapid t=${head}.${body}.${b64u(sig)}, k=${keys.public}`;
+}
+
+// Encrypts the message for one browser (RFC 8291, "aes128gcm").
+async function encryptFor(sub, text) {
+  const uaPublic = unb64u(sub.p256dh), authSecret = unb64u(sub.auth);
+  const local = await crypto.subtle.generateKey({ name: 'ECDH', namedCurve: 'P-256' }, true, ['deriveBits']);
+  const asPublic = new Uint8Array(await crypto.subtle.exportKey('raw', local.publicKey));
+  const uaKey = await crypto.subtle.importKey('raw', uaPublic, { name: 'ECDH', namedCurve: 'P-256' }, false, []);
+  const shared = new Uint8Array(await crypto.subtle.deriveBits({ name: 'ECDH', public: uaKey }, local.privateKey, 256));
+  const hkdf = async (salt, ikm, info, bits) => new Uint8Array(await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt, info }, await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']), bits));
+  const ikm = await hkdf(authSecret, shared, join(enc.encode('WebPush: info\0'), uaPublic, asPublic), 256);
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await hkdf(salt, ikm, enc.encode('Content-Encoding: aes128gcm\0'), 128);
+  const nonce = await hkdf(salt, ikm, enc.encode('Content-Encoding: nonce\0'), 96);
+  const aes = await crypto.subtle.importKey('raw', cek, 'AES-GCM', false, ['encrypt']);
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv: nonce }, aes, join(enc.encode(text), new Uint8Array([2]))));
+  const header = new Uint8Array(21);
+  header.set(salt);
+  new DataView(header.buffer).setUint32(16, 4096);
+  header[20] = asPublic.length;
+  return join(header, asPublic, cipher);
+}
+
+async function sendPush(sub, message, keys) {
+  const res = await fetch(sub.endpoint, {
+    method: 'POST',
+    headers: {
+      Authorization: await vapidHeader(sub.endpoint, keys),
+      'Content-Encoding': 'aes128gcm',
+      'Content-Type': 'application/octet-stream',
+      TTL: '900',
+      Urgency: 'high',
+    },
+    body: await encryptFor(sub, JSON.stringify(message)),
+  });
+  return res.status;
+}
+
+const REMIND = {
+  en: { student: 'Your class starts in {n} minutes. Tap to join.', parent: "{name}'s class starts in {n} minutes. Tap to join.", staff: 'Your class starts in {n} minutes. Tap to start it.', test: 'Reminders are working. You will get one 10 minutes before each class.' },
+  ml: { student: 'നിങ്ങളുടെ ക്ലാസ് {n} മിനിറ്റിനുള്ളിൽ തുടങ്ങും. ചേരാൻ ടാപ്പ് ചെയ്യൂ.', parent: '{name} — ക്ലാസ് {n} മിനിറ്റിനുള്ളിൽ തുടങ്ങും. ചേരാൻ ടാപ്പ് ചെയ്യൂ.', test: 'ഓർമ്മപ്പെടുത്തലുകൾ ശരിയായി പ്രവർത്തിക്കുന്നു. ഓരോ ക്ലാസിനും 10 മിനിറ്റ് മുമ്പ് അറിയിപ്പ് വരും.' },
+  tr: { student: 'Dersin {n} dakika sonra başlıyor. Katılmak için dokun.', parent: '{name} için ders {n} dakika sonra başlıyor. Katılmak için dokunun.', test: 'Hatırlatmalar çalışıyor. Her dersten 10 dakika önce bildirim gelecek.' },
+  ar: { student: 'يبدأ درسك بعد {n} دقائق. اضغط للانضمام.', parent: 'يبدأ درس {name} بعد {n} دقائق. اضغط للانضمام.', test: 'التذكيرات تعمل. سيصلك تنبيه قبل كل درس بعشر دقائق.' },
+};
+function reminderText(sub, key, vars) {
+  const pack = REMIND[sub.lang] || REMIND.en;
+  let s = pack[key] || REMIND.en[key];
+  Object.keys(vars || {}).forEach((k) => { s = s.split(`{${k}}`).join(vars[k]); });
+  return s;
+}
+
+async function sendReminders(env) {
+  if (!dbReady(env)) return { sent: 0, gone: 0 };
+  const due = await db(env, 'ilm_svc_due_meetings', {});
+  if (!Array.isArray(due) || !due.length) return { sent: 0, gone: 0 };
+  const keys = await vapidKeys(env);
+  const sent = [], gone = [];
+  for (const m of due) {
+    const n = Math.max(1, Math.round((new Date(m.starts_at).getTime() - Date.now()) / 60000));
+    await Promise.all((m.subs || []).map(async (sub) => {
+      const kind = sub.kind === 'parent' ? 'parent' : sub.kind === 'staff' ? 'staff' : 'student';
+      const message = {
+        title: m.title ? `${m.title} · ${m.class_name}` : m.class_name,
+        body: reminderText(kind === 'staff' ? { lang: 'en' } : sub, kind, { n, name: sub.name || '' }),
+        url: m.link || m.portal || '',
+        tag: `class-${m.id}`,
+      };
+      try {
+        const status = await sendPush(sub, message, keys);
+        if (status === 404 || status === 410) gone.push(sub.endpoint);
+        else if (status < 300) sent.push(sub.endpoint);
+      } catch (err) { /* one bad browser must not stop the others */ }
+    }));
+  }
+  if (sent.length || gone.length) await db(env, 'ilm_svc_push_done', { p_sent: sent, p_gone: gone });
+  return { sent: sent.length, gone: gone.length };
+}
+
+async function pushKey(env) {
+  if (!dbReady(env)) return json({ ok: false, error: 'Reminders are not switched on yet.' }, 503);
+  try { return json({ ok: true, key: (await vapidKeys(env)).public }); }
+  catch (err) { return json({ ok: false, error: 'Reminders are not ready yet. Please try again later.' }, 502); }
+}
+
+async function pushTest(request, env) {
+  if (!dbReady(env)) return json({ ok: false, error: 'Reminders are not switched on yet.' }, 503);
+  let body;
+  try { body = await request.json(); } catch { return json({ ok: false, error: 'Invalid request' }, 400); }
+  const endpoint = String(body.endpoint || '').slice(0, 1000);
+  if (!/^https?:\/\//.test(endpoint)) return json({ ok: false, error: 'Invalid request' }, 400);
+  try {
+    const sub = await db(env, 'ilm_svc_push_sub', { p_endpoint: endpoint });
+    if (!sub) return json({ ok: false, error: 'Reminders are not switched on for this device yet.' }, 404);
+    const status = await sendPush(sub, { title: 'ILM International', body: reminderText(sub, 'test'), url: sub.portal || '', tag: 'ilm-test' }, await vapidKeys(env));
+    if (status === 404 || status === 410) {
+      await db(env, 'ilm_svc_push_done', { p_sent: [], p_gone: [endpoint] });
+      return json({ ok: false, error: 'This device stopped accepting reminders. Please switch them on again.' }, 410);
+    }
+    return status < 300 ? json({ ok: true }) : json({ ok: false, error: `The reminder could not be delivered (${status}).` }, 502);
+  } catch (err) {
+    return json({ ok: false, error: 'The reminder could not be sent. Please try again later.' }, 502);
+  }
+}
+
 export default {
   async fetch(request, env) {
     const { pathname } = new URL(request.url);
@@ -230,11 +379,22 @@ export default {
       if (pathname === '/api/pay/webhook') return payWebhook(request, env);
       return json({ ok: false, error: 'Not found' }, 404);
     }
+    if (pathname.startsWith('/api/push/')) {
+      if (request.method === 'OPTIONS') return new Response(null, { status: 204, headers: CORS });
+      if (pathname === '/api/push/key' && request.method === 'GET') return pushKey(env);
+      if (pathname === '/api/push/test' && request.method === 'POST') return pushTest(request, env);
+      return json({ ok: false, error: 'Not found' }, 404);
+    }
     // Keep the server files private
     if (['/worker.js', '/wrangler.jsonc', '/README.txt', '/firebase.json', '/supabase-setup.sql', '/PORTAL-SETUP.txt'].includes(pathname)) {
       return new Response('Not found', { status: 404 });
     }
     // Serve the website files (index.html, fees.html, images, styles…)
     return env.ASSETS.fetch(request);
+  },
+
+  // runs every minute (see "triggers" in wrangler.jsonc): sends the 10-minute class reminders
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(sendReminders(env).catch(() => {}));
   },
 };

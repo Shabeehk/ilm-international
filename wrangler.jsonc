@@ -10,6 +10,8 @@
   },
   // Cloudflare creates this storage automatically on the next deploy
   "kv_namespaces": [{ "binding": "LEADS" }],
+  // Every minute: send the "class starts in 10 minutes" reminders
+  "triggers": { "crons": ["* * * * *"] },
   // Public address of the portal database. The private keys are stored as Secrets in the Cloudflare dashboard, never here.
   "vars": { "SUPABASE_URL": "https://bplldiboehivuivdlyqz.supabase.co" }
 }

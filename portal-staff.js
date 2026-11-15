@@ -6,12 +6,12 @@
 
   var D = null, me = null, page = 'overview', param = null, isAdmin = false;
   var NAV = [
-    ['overview', 'Overview', 'home'], ['students', 'Students', 'users'], ['classes', 'Classes', 'video'],
+    ['overview', 'Home', 'home'], ['schedule', 'Schedule', 'clock'], ['students', 'Students', 'users'], ['classes', 'Classes', 'video'],
     ['attendance', 'Attendance', 'calendar'], ['homework', 'Homework', 'pen'], ['syllabus', 'Syllabus', 'book'],
     ['fees', 'Fees', 'coin', true], ['teachers', 'Teachers', 'cap', true], ['settings', 'Settings', 'settings', true]
   ];
   var PLAN_NAMES = { weekend: 'Weekend Class', group: 'Small Group', personal: 'Personal 1-to-1' };
-  var ui = { search: '', classFilter: '', attClass: '', attDay: I.today(), att: {}, hwClass: '', level: 1, period: I.today().slice(0, 7), feeFilter: 'month', syllabus: null, fees: null };
+  var ui = { photo: undefined, search: '', classFilter: '', attClass: '', attDay: I.today(), att: {}, hwClass: '', level: 1, period: I.today().slice(0, 7), feeFilter: 'month', syllabus: null, fees: null };
 
   // ------------------------------------------------------------ lookups
   function level(id) { return D.levels.filter(function (l) { return l.id === id; })[0] || {}; }
@@ -37,7 +37,12 @@
   }
 
   // -------------------------------------------------------------- shell
-  async function load() { D = await rpc('ilm_staff_bootstrap'); me = D.me; isAdmin = me.role === 'admin'; }
+  async function load() {
+    D = await rpc('ilm_staff_bootstrap'); me = D.me; isAdmin = me.role === 'admin';
+    D.meetings = D.meetings || [];
+    I.setRemind({ api: (D.settings && D.settings.pay_api) || '', save: function (sub, on) { return rpc('ilm_staff_push', { p_sub: sub, p_on: on }); } });
+  }
+  function meetingsLive() { return D.meetings.filter(function (m) { return I.classState(m).state !== 'over'; }); }
   async function start(profile) {
     me = profile;
     await load();
@@ -53,23 +58,61 @@
     load().then(function () { go(p, prm); }, function (e) { I.fail(e); go(p, prm); });
   };
 
+  function navCount(key) {
+    if (key === 'homework') return D.homework_to_review;
+    if (key === 'teachers') return isAdmin ? D.teachers.filter(function (t) { return !t.approved; }).length : 0;
+    if (key === 'fees') return D.fees ? D.fees.overdue_count : 0;
+    if (key === 'schedule') return meetingsLive().filter(function (m) { return I.classState(m).state !== 'later'; }).length;
+    return 0;
+  }
+  function isHere(key) { return page === key || (page === 'student' && key === 'students'); }
+  function navItems() { return NAV.filter(function (n) { return !n[3] || isAdmin; }); }
   function navHtml() {
-    var pending = isAdmin ? D.teachers.filter(function (t) { return !t.approved; }).length : 0;
-    return NAV.filter(function (n) { return !n[3] || isAdmin; }).map(function (n) {
-      var count = n[0] === 'homework' ? D.homework_to_review : n[0] === 'teachers' ? pending : n[0] === 'fees' && D.fees ? D.fees.overdue_count : 0;
-      return '<button class="navlink" data-act="nav" data-page="' + n[0] + '"' + (page === n[0] || (page === 'student' && n[0] === 'students') ? ' aria-current="page"' : '') + '>' + icon(n[2]) + '<span>' + n[1] + '</span>' + (count ? '<span class="count">' + count + '</span>' : '') + '</button>';
+    return navItems().map(function (n) {
+      var count = navCount(n[0]);
+      return '<button class="navlink" data-act="nav" data-page="' + n[0] + '"' + (isHere(n[0]) ? ' aria-current="page"' : '') + '>' + icon(n[2]) + '<span>' + n[1] + '</span>' + (count ? '<span class="count">' + count + '</span>' : '') + '</button>';
     }).join('');
   }
+  // phone: four main sections at the bottom of the screen, everything else under "More"
+  function tabKeys() { return ['overview', 'schedule', 'students', isAdmin ? 'fees' : 'attendance']; }
+  function tabbarHtml() {
+    var keys = tabKeys(), more = navItems().filter(function (n) { return keys.indexOf(n[0]) < 0; }).some(function (n) { return isHere(n[0]); }) || page === 'profile';
+    return '<nav class="tabbar" aria-label="Sections">' + keys.map(function (k) {
+      var n = NAV.filter(function (x) { return x[0] === k; })[0], count = navCount(k);
+      return '<button data-act="nav" data-page="' + k + '"' + (isHere(k) ? ' aria-current="page"' : '') + '>' + icon(n[2]) + '<span>' + n[1] + '</span>' + (count ? '<span class="count">' + count + '</span>' : '') + '</button>';
+    }).join('') + '<button data-act="moreMenu"' + (more ? ' aria-current="page"' : '') + '>' + icon('grid') + '<span>More</span>' + (navItems().some(function (n) { return keys.indexOf(n[0]) < 0 && navCount(n[0]); }) ? '<span class="count">•</span>' : '') + '</button></nav>';
+  }
+  actions.moreMenu = function () {
+    var keys = tabKeys();
+    modal('<div class="row"><div class="row nw grow">' + avatar(me.full_name, 5, '', me.photo) + '<div><b>' + esc(me.full_name) + '</b><div class="small muted">' + (isAdmin ? 'Academy admin' : 'Teacher') + '</div></div></div><button class="btn ghost sm" data-act="closeModal" aria-label="Close">' + icon('x') + '</button></div>' +
+      '<div class="sheet-list">' + navItems().filter(function (n) { return keys.indexOf(n[0]) < 0; }).map(function (n) {
+        var count = navCount(n[0]);
+        return '<button data-act="navClose" data-page="' + n[0] + '"' + (isHere(n[0]) ? ' aria-current="page"' : '') + '>' + icon(n[2]) + '<span>' + n[1] + '</span>' + (count ? '<span class="count">' + count + '</span>' : '') + '</button>';
+      }).join('') +
+      '<button data-act="navClose" data-page="profile"' + (page === 'profile' ? ' aria-current="page"' : '') + '>' + icon('user') + '<span>My profile</span></button>' +
+      '<button data-act="staffLogout">' + icon('logout') + '<span>Sign out</span></button></div>');
+  };
+  actions.navClose = function (el) { closeModal(); actions.nav(el); };
   function render() {
     document.body.className = 'staff';
     document.title = 'Dashboard · ILM International';
     app.innerHTML = '<div class="shell"><aside class="side">' + I.brand(true) + navHtml() +
-      '<div class="who"><div class="row" style="flex-wrap:nowrap">' + avatar(me.full_name, 5, 'sm') + '<div style="min-width:0"><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(me.full_name) + '</b><span>' + (isAdmin ? 'Academy admin' : 'Teacher') + '</span></div></div>' +
+      '<div class="who"><button class="me" data-act="nav" data-page="profile" title="My profile">' + avatar(me.full_name, 5, 'sm', me.photo) + '<div style="min-width:0"><b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(me.full_name) + '</b><span>' + (isAdmin ? 'Academy admin' : 'Teacher') + ' · My profile</span></div></button>' +
       '<button class="navlink" data-act="staffLogout">' + icon('logout') + 'Sign out</button></div></aside>' +
-      '<div><nav class="mobnav" aria-label="Sections">' + navHtml() + '<button class="navlink" data-act="staffLogout">' + icon('logout') + 'Sign out</button></nav>' +
-      '<main class="main" id="main"></main></div></div>';
-    var cur = document.querySelector('.mobnav [aria-current]'); if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'center' });
+      '<div><header class="mobtop">' + I.brand(true) + '<span class="grow"></span><button class="me" data-act="nav" data-page="profile" aria-label="My profile">' + avatar(me.full_name, 5, 'sm', me.photo) + '</button></header>' +
+      '<div id="bannerSlot">' + I.liveBanner(meetingsLive(), 'Start class') + '</div><main class="main" id="main"></main>' + tabbarHtml() + '</div></div>';
     (PAGES[page] || PAGES.overview)(document.getElementById('main'));
+    I.every(tickStaff);
+  }
+  // every 30 seconds: move the countdowns on, show the "starts in 10 minutes" banner
+  function tickStaff() {
+    if (!document.querySelector('.shell')) return;
+    document.querySelectorAll('[data-cd-start]').forEach(function (el) {
+      var st = I.classState({ starts_at: el.dataset.cdStart, minutes: Number(el.dataset.cdMin) });
+      el.textContent = st.state === 'over' ? 'Finished' : st.text;
+      var row = el.closest('.meet-row,.nextclass'); if (row) row.className = row.className.replace(/\b(later|soon|live|over)\b/g, '').trim() + ' ' + st.state;
+    });
+    var slot = document.getElementById('bannerSlot'); if (slot) slot.innerHTML = I.liveBanner(meetingsLive(), 'Start class');
   }
   function head(title, sub, right) { return '<div class="page-h"><div class="grow"><h1>' + esc(title) + '</h1>' + (sub ? '<p>' + esc(sub) + '</p>' : '') + '</div>' + (right || '') + '</div>'; }
   var PAGES = {};
@@ -86,6 +129,10 @@
     if (D.homework_to_review) attention.push('<div class="li">' + icon('pen') + '<span class="grow"><b>' + D.homework_to_review + ' homework answer' + (D.homework_to_review > 1 ? 's' : '') + '</b> to mark</span><button class="btn soft sm" data-act="nav" data-page="homework">Open</button></div>');
     if (f && f.overdue_count) attention.push('<div class="li">' + icon('coin') + '<span class="grow"><b>' + f.overdue_count + ' fee' + (f.overdue_count > 1 ? 's are' : ' is') + ' overdue</b><span class="small muted" style="display:block">Send a reminder from the Fees page</span></span><button class="btn soft sm" data-act="nav" data-page="fees">Open</button></div>');
     low.slice(0, 4).forEach(function (s) { attention.push('<div class="li">' + avatar(s.full_name, s.avatar, 'sm') + '<span class="grow"><b>' + esc(s.full_name) + '</b> — attendance is ' + s.attendance + '%</span><button class="btn soft sm" data-act="openStudent" data-id="' + s.id + '">View</button></div>'); });
+    D.students.filter(function (s) { return isAdmin && s.added_by && s.added_by !== me.id && Date.now() - new Date(s.created_at).getTime() < 14 * 864e5; }).slice(0, 5).forEach(function (s) {
+      var tt = teacher(s.added_by);
+      attention.push('<div class="li">' + avatar(s.full_name, s.avatar, 'sm') + '<span class="grow"><b>' + esc(s.full_name) + '</b> was added by ' + esc(tt ? tt.full_name : 'a teacher') + '<span class="small muted" style="display:block">Monthly fee: ' + esc(money(s.monthly_fee, cur())) + (s.plan ? ' · ' + esc(PLAN_NAMES[s.plan] || s.plan) : ' · no plan') + '</span></span><button class="btn soft sm" data-act="studentForm" data-id="' + s.id + '">Check fee</button></div>');
+    });
     quiet.slice(0, 5).forEach(function (s) { attention.push('<div class="li">' + avatar(s.full_name, s.avatar, 'sm') + '<span class="grow"><b>' + esc(s.full_name) + '</b> has not opened the portal ' + (s.last_seen ? 'for a week' : 'yet') + '</span><button class="btn soft sm" data-act="openStudent" data-id="' + s.id + '">View</button></div>'); });
 
     var steps = '';
@@ -95,7 +142,18 @@
         '<div class="li"><span class="unit-n">2</span><span class="grow"><b>Add your students</b><span class="small muted" style="display:block">Each child gets a Student ID and a secret PIN automatically.</span></span><button class="btn sm" data-act="studentForm"' + (D.classes.length ? '' : ' disabled') + '>Add student</button></div>' +
         '<div class="li"><span class="unit-n">3</span><span class="grow"><b>Send the login to parents</b><span class="small muted" style="display:block">One tap sends the ID, PIN and the private parent link on WhatsApp.</span></span></div></div></section>';
     }
+    if (!isAdmin && D.classes.length && !D.students.length) {
+      steps = '<section class="card row" style="margin-bottom:18px">' + icon('users') + '<div class="grow"><b>Add your students</b><p class="small muted">Each child gets a Student ID and a secret PIN. One tap sends them to the parent on WhatsApp.</p></div><button class="btn" data-act="studentForm">' + icon('plus') + 'Add student</button></section>';
+    }
+    var canStudents = isAdmin || D.classes.length;
     el.innerHTML = head('Assalamu alaykum, ' + I.firstName(me.full_name), isAdmin ? 'Here is how the academy is doing today.' : 'Here is how your classes are doing today.') + steps +
+      staffNextCard() +
+      '<section class="quick" style="margin:18px 0">' +
+      '<button data-act="meetForm"' + (D.classes.length ? '' : ' disabled') + '>' + icon('clock') + '<span>Schedule a class<br><small>Link + 10-minute reminder</small></span></button>' +
+      '<button data-act="studentForm"' + (canStudents ? '' : ' disabled') + '>' + icon('plus') + '<span>Add a student<br><small>Creates the ID and PIN</small></span></button>' +
+      '<button data-act="nav" data-page="attendance">' + icon('calendar') + '<span>Mark attendance<br><small>Present, late, absent</small></span></button>' +
+      '<button data-act="nav" data-page="homework">' + icon('pen') + '<span>Homework<br><small>' + (D.homework_to_review ? D.homework_to_review + ' to mark' : 'Set or mark') + '</small></span></button></section>' +
+      (!D.reminders && I.push.offer() ? '<section class="card stack" style="margin-bottom:18px;gap:10px"><b>Get a reminder 10 minutes before each class</b>' + I.remindRow() + '<p class="small muted">Your students and parents can switch this on too, from their own page.</p></section>' : '') +
       '<section class="tiles" style="margin-bottom:18px">' +
       '<div class="tile"><span class="lbl">' + icon('users') + 'Students</span><b>' + active.length + '</b><span class="sub">' + (active.length - quiet.length) + ' active this week</span></div>' +
       '<div class="tile"><span class="lbl">' + icon('video') + 'Classes</span><b>' + D.classes.filter(function (c) { return c.active; }).length + '</b><span class="sub">' + (isAdmin ? D.teachers.filter(function (t) { return t.approved; }).length + ' teachers' : 'Your classes') + '</span></div>' +
@@ -109,7 +167,19 @@
         var link = I.safeUrl(c.meet_link);
         return '<div class="li"><span class="grow"><b>' + esc(c.name) + '</b><span class="small muted" style="display:block">' + esc([level(c.level_id).name, c.schedule, c.students + ' students'].filter(Boolean).join(' · ')) + '</span></span>' + (link ? '<a class="btn sm" href="' + esc(link) + '" target="_blank" rel="noopener">' + icon('video') + 'Start</a>' : '') + '</div>';
       }).join('') + '</div>' : '<p class="muted">' + (isAdmin ? 'No classes yet.' : 'The admin has not given you a class yet.') + '</p>') + '</section></div>';
+    I.paintRemind();
   };
+  function staffNextCard() {
+    var m = meetingsLive()[0];
+    if (!m) return D.classes.length ? '<section class="card row" style="margin-bottom:6px">' + icon('clock') + '<div class="grow"><b>No live class is scheduled yet</b><p class="small muted">Schedule your classes and everyone gets a reminder 10 minutes before.</p></div><button class="btn" data-act="meetForm">' + icon('plus') + 'Schedule a class</button></section>' : '';
+    var st = I.classState(m), w = I.whenParts(m.starts_at), link = I.safeUrl(m.link), c = klass(m.class_id);
+    return '<section class="nextclass ' + st.state + '"><div class="row" style="align-items:flex-start"><div class="grow"><span class="eyebrow">Your next class</span><div class="nc-when">' + esc(w.day) + ' · ' + esc(w.time) + '</div>' +
+      '<div class="nc-title">' + esc([m.title, m.class_name].filter(Boolean).join(' · ')) + '</div><p class="small muted">' + esc([m.minutes + ' min', c ? c.students + ' student' + (c.students === 1 ? '' : 's') : '', isAdmin && m.teacher ? m.teacher : ''].filter(Boolean).join(' · ')) + '</p></div>' +
+      '<span class="countdown" data-cd-start="' + esc(m.starts_at) + '" data-cd-min="' + m.minutes + '">' + esc(st.text) + '</span></div>' +
+      '<div class="row">' + (link ? '<a class="btn gold" href="' + esc(link) + '" target="_blank" rel="noopener">' + icon('video') + 'Start class</a>' : '<button class="btn soft" data-act="meetForm" data-id="' + m.id + '">Add the meeting link</button>') +
+      '<button class="btn ghost" data-act="toAttendance" data-id="' + m.class_id + '">' + icon('calendar') + 'Attendance</button><button class="btn ghost" data-act="copyInvite" data-id="' + m.id + '">' + icon('copy') + 'Copy invitation</button>' +
+      '<button class="btn ghost" data-act="nav" data-page="schedule">All classes</button></div></section>';
+  }
 
   // ----------------------------------------------------------- students
   PAGES.students = function (el) {
@@ -118,32 +188,33 @@
       return (!ui.classFilter || s.class_id === ui.classFilter) && (!q || (s.full_name + ' ' + s.code + ' ' + (s.parent_name || '')).toLowerCase().indexOf(q) >= 0);
     });
     el.innerHTML = head('Students', D.students.length + ' student' + (D.students.length === 1 ? '' : 's') + (isAdmin ? ' in the academy' : ' in your classes'),
-      '<div class="row">' + (D.students.length ? '<button class="btn ghost" data-act="exportStudents">' + icon('download') + 'Download list</button>' : '') + (isAdmin ? '<button class="btn" data-act="studentForm">' + icon('plus') + 'Add student</button>' : '') + '</div>') +
+      '<div class="row">' + (D.students.length ? '<button class="btn ghost" data-act="exportStudents">' + icon('download') + 'Download list</button>' : '') + (isAdmin || D.classes.length ? '<button class="btn" data-act="studentForm">' + icon('plus') + 'Add student</button>' : '') + '</div>') +
       '<div class="toolbar"><input type="search" id="stSearch" placeholder="Search by name or ID" value="' + esc(ui.search) + '" aria-label="Search students">' +
       '<select id="stClass" aria-label="Filter by class">' + classOptions(ui.classFilter, 'All classes') + '</select></div>' +
       (rows.length ? '<div class="tablewrap"><table class="t"><thead><tr><th>Student</th><th>Class</th><th>Lessons</th><th class="num">Quiz avg</th><th class="num">Attendance</th><th class="num">Stars</th><th>Last seen</th>' + (isAdmin ? '<th class="num">Fees due</th>' : '') + '</tr></thead><tbody>' +
         rows.map(function (s) {
           var c = klass(s.class_id), pct = s.lessons_total ? Math.round(100 * s.lessons_read / s.lessons_total) : 0;
-          return '<tr class="click" data-act="openStudent" data-id="' + s.id + '" tabindex="0"><td><div class="row" style="flex-wrap:nowrap">' + avatar(s.full_name, s.avatar, 'sm') + '<div><b>' + esc(s.full_name) + '</b>' + (s.active ? '' : ' <span class="chip grey">Not active</span>') + '<div class="small muted">' + esc(s.code) + ' · ' + esc(level(s.level_id).name || '') + '</div></div></div></td>' +
+          return '<tr class="click" data-act="openStudent" data-id="' + s.id + '" tabindex="0"><td><div class="row" style="flex-wrap:nowrap">' + avatar(s.full_name, s.avatar, 'sm') + '<div><b>' + esc(s.full_name) + '</b>' + (s.active ? '' : ' <span class="chip grey">Not active</span>') + '<div class="small muted">' + esc(s.code) + ' · ' + esc(level(s.level_id).name || '') + ' · ' + esc(I.LANGS[s.lang] || 'English') + '</div></div></div></td>' +
             '<td>' + esc(c ? c.name : '—') + '</td><td style="min-width:130px"><div class="bar"><i style="width:' + pct + '%"></i></div><span class="small muted">' + s.lessons_read + ' of ' + s.lessons_total + '</span></td>' +
             '<td class="num">' + (s.quiz_avg == null ? '—' : s.quiz_avg + '%') + '</td><td class="num">' + (s.attendance == null ? '—' : s.attendance + '%') + '</td><td class="num">' + s.stars + '</td><td>' + esc(ago(s.last_seen)) + '</td>' +
             (isAdmin ? '<td class="num">' + (Number(s.due) > 0 ? '<span class="chip red">' + esc(money(s.due, cur())) + '</span>' : '<span class="chip green">Paid</span>') + '</td>' : '') + '</tr>';
         }).join('') + '</tbody></table></div>'
-        : '<div class="card">' + empty('users', D.students.length ? 'No student matches your search.' : (isAdmin ? 'No students yet. Add your first student to create their login.' : 'No students are in your classes yet.'), isAdmin && !D.students.length ? '<button class="btn" data-act="studentForm">' + icon('plus') + 'Add student</button>' : '') + '</div>');
+        : '<div class="card">' + empty('users', D.students.length ? 'No student matches your search.' : (isAdmin || D.classes.length ? 'No students yet. Add your first student to create their login.' : 'No students are in your classes yet. The admin will give you a class first.'), (isAdmin || D.classes.length) && !D.students.length ? '<button class="btn" data-act="studentForm">' + icon('plus') + 'Add student</button>' : '') + '</div>');
     var s = document.getElementById('stSearch');
     s.addEventListener('input', function () { ui.search = s.value; var pos = s.selectionStart; PAGES.students(el); var n = document.getElementById('stSearch'); n.focus(); n.setSelectionRange(pos, pos); });
     document.getElementById('stClass').addEventListener('change', function (e) { ui.classFilter = e.target.value; PAGES.students(el); });
   };
   actions.openStudent = function (el) { go('student', el.dataset.id); };
   actions.exportStudents = function () {
-    var rows = [['Student ID', 'Name', 'Gender', 'Birth year', 'Level', 'Class', 'Parent', 'WhatsApp', 'Country', 'Plan', 'Monthly fee', 'Stars', 'Lessons read', 'Quiz average %', 'Attendance %', 'Active', 'Parent report link']];
-    D.students.forEach(function (s) { var c = klass(s.class_id); rows.push([s.code, s.full_name, s.gender, s.birth_year, level(s.level_id).name, c ? c.name : '', s.parent_name, s.parent_whatsapp, s.country, PLAN_NAMES[s.plan] || '', isAdmin ? s.monthly_fee : '', s.stars, s.lessons_read, s.quiz_avg, s.attendance, s.active ? 'Yes' : 'No', parentLink(s)]); });
+    var rows = [['Student ID', 'Name', 'Gender', 'Birth year', 'Level', 'Language', 'Class', 'Parent', 'WhatsApp', 'Country', 'Plan', 'Monthly fee', 'Stars', 'Lessons read', 'Quiz average %', 'Attendance %', 'Active', 'Parent report link']];
+    D.students.forEach(function (s) { var c = klass(s.class_id); rows.push([s.code, s.full_name, s.gender, s.birth_year, level(s.level_id).name, I.LANGS[s.lang] || 'English', c ? c.name : '', s.parent_name, s.parent_whatsapp, s.country, PLAN_NAMES[s.plan] || '', isAdmin ? s.monthly_fee : '', s.stars, s.lessons_read, s.quiz_avg, s.attendance, s.active ? 'Yes' : 'No', parentLink(s)]); });
     csvDownload('ilm-students.csv', rows);
   };
 
   actions.studentForm = function (el) {
     var s = el.dataset.id ? student(el.dataset.id) : {};
     var plans = (D.settings && D.settings.plans) || {};
+    if (!isAdmin) return teacherStudentForm(s, el.dataset.class);
     modal('<h2>' + (s.id ? 'Edit student' : 'Add a student') + '</h2><form class="stack" data-form="saveStudent">' + (s.id ? '<input type="hidden" name="id" value="' + s.id + '">' : '') +
       '<div class="grid2"><label class="f">Student\'s full name<input type="text" name="full_name" value="' + esc(s.full_name) + '" required></label>' +
       '<label class="f">Boy or girl<select name="gender">' + opt('', 'Choose', s.gender) + opt('boy', 'Boy', s.gender) + opt('girl', 'Girl', s.gender) + '</select></label></div>' +
@@ -155,14 +226,33 @@
       '<div class="grid3"><label class="f">Country<input type="text" name="country" value="' + esc(s.country) + '"></label>' +
       '<label class="f">Plan<select name="plan" id="sfPlan">' + opt('', 'Choose', s.plan) + Object.keys(PLAN_NAMES).map(function (k) { return opt(k, PLAN_NAMES[k], s.plan); }).join('') + '</select></label>' +
       '<label class="f">Monthly fee (' + esc(cur()) + ')<input type="number" name="monthly_fee" id="sfFee" min="0" step="0.01" value="' + esc(s.id ? Number(s.monthly_fee) : '') + '"></label></div>' +
+      '<div class="grid2"><label class="f">Lesson language <span class="hint">Lessons, quizzes and exams open in this language. The student can change it.</span><select name="lang">' + Object.keys(I.LANGS).map(function (l) { return opt(l, I.LANGS[l], s.lang || 'en'); }).join('') + '</select></label><span></span></div>' +
       (s.id ? '<label class="f">Status<select name="active">' + opt('true', 'Active — can log in', String(s.active)) + opt('false', 'Not active — login switched off', String(s.active)) + '</select></label>' : '<p class="info">The Student ID and secret PIN are created automatically when you save.</p>') +
       '<div class="foot">' + (s.id ? '<button type="button" class="btn danger" data-act="deleteStudent" data-id="' + s.id + '">' + icon('trash') + 'Delete</button><span class="grow"></span>' : '') + '<button type="button" class="btn ghost" data-act="closeModal">Cancel</button><button class="btn" type="submit">' + (s.id ? 'Save changes' : 'Create student') + '</button></div></form>', true);
     document.getElementById('sfClass').addEventListener('change', function (e) { var c = klass(e.target.value); if (c) { if (c.level_id) document.getElementById('sfLevel').value = c.level_id; if (c.plan && !document.getElementById('sfPlan').value) { document.getElementById('sfPlan').value = c.plan; document.getElementById('sfFee').value = plans[c.plan] || ''; } } });
     document.getElementById('sfPlan').addEventListener('change', function (e) { if (plans[e.target.value] != null) document.getElementById('sfFee').value = plans[e.target.value]; });
   };
+  function teacherStudentForm(s, classId) {
+    if (!D.classes.length) return toast('The admin needs to give you a class first.', 'bad');
+    modal('<h2>' + (s.id ? 'Edit student' : 'Add a student') + '</h2><form class="stack" data-form="saveStudent">' + (s.id ? '<input type="hidden" name="id" value="' + s.id + '">' : '') +
+      '<div class="grid2"><label class="f">Student\'s full name<input type="text" name="full_name" value="' + esc(s.full_name) + '" required></label>' +
+      '<label class="f">Boy or girl<select name="gender">' + opt('', 'Choose', s.gender) + opt('boy', 'Boy', s.gender) + opt('girl', 'Girl', s.gender) + '</select></label></div>' +
+      '<div class="grid3"><label class="f">Year of birth<input type="number" name="birth_year" min="2005" max="2030" value="' + esc(s.birth_year) + '"></label>' +
+      '<label class="f">Class<select name="class_id" id="sfClass" required>' + D.classes.filter(function (c) { return c.active; }).map(function (c) { return opt(c.id, c.name, s.class_id || classId); }).join('') + '</select></label>' +
+      '<label class="f">Level<select name="level_id" id="sfLevel">' + D.levels.map(function (l) { return opt(l.id, l.name + ' (' + l.age_min + '–' + l.age_max + ')', s.level_id || (klass(s.class_id || classId) || D.classes[0]).level_id || 1); }).join('') + '</select></label></div>' +
+      '<div class="grid2"><label class="f">Parent\'s name<input type="text" name="parent_name" value="' + esc(s.parent_name) + '"></label>' +
+      '<label class="f">Parent\'s WhatsApp <span class="hint">With country code, like +44 7700 900123</span><input type="tel" name="parent_whatsapp" value="' + esc(s.parent_whatsapp) + '"></label></div>' +
+      '<div class="grid2"><label class="f">Country<input type="text" name="country" value="' + esc(s.country) + '"></label>' +
+      '<label class="f">Lesson language<select name="lang">' + Object.keys(I.LANGS).map(function (l) { return opt(l, I.LANGS[l], s.lang || 'en'); }).join('') + '</select></label></div>' +
+      (s.id ? '' : '<p class="info">The Student ID and secret PIN are made when you save. The academy admin sets the monthly fee.</p>') +
+      '<div class="foot"><button type="button" class="btn ghost" data-act="closeModal">Cancel</button><button class="btn" type="submit">' + (s.id ? 'Save changes' : 'Create student') + '</button></div></form>', true);
+    document.getElementById('sfClass').addEventListener('change', function (e) { var c = klass(e.target.value); if (c && c.level_id) document.getElementById('sfLevel').value = c.level_id; });
+  }
   forms.saveStudent = function (f, d, btn) {
     busy(btn, async function () {
-      var out = await rpc('ilm_admin_save_student', { p: d });
+      // admins on a database that was not updated yet still use the older door
+      var out = isAdmin ? await rpc('ilm_staff_save_student', { p: d }).catch(function (e) { if (/needs its update/.test(e.message)) return rpc('ilm_admin_save_student', { p: d }); throw e; })
+        : await rpc('ilm_staff_save_student', { p: d });
       await load();
       if (out.pin) { page = 'student'; param = out.id; render(); credsModal(student(out.id), out.pin, true); }
       else { closeModal(); toast('Saved'); render(); }
@@ -210,13 +300,15 @@
     var reminder = 'Assalamu alaykum' + (s.parent_name ? ' ' + s.parent_name : '') + '. Here is ' + I.firstName(s.full_name) + '\'s private progress page on the ILM International portal:\n' + parentLink(s);
     el.innerHTML = '<div class="page-h"><button class="btn ghost sm" data-act="nav" data-page="students">' + icon('back') + 'All students</button></div>' +
       '<section class="card" style="margin-bottom:18px"><div class="row">' + avatar(s.full_name, s.avatar, 'lg') + '<div class="grow"><h1 style="font-size:1.9rem;line-height:1.1">' + esc(s.full_name) + '</h1>' +
-      '<div class="row" style="gap:6px;margin-top:8px"><span class="chip">' + icon('key') + esc(s.code) + '</span><span class="chip gold">' + esc(level(s.level_id).name || 'No level') + '</span>' + (c ? '<span class="chip blue">' + esc(c.name) + '</span>' : '<span class="chip grey">No class</span>') + (s.active ? '' : '<span class="chip red">Not active</span>') + '<span class="chip grey">Last seen: ' + esc(ago(s.last_seen)) + '</span></div></div>' +
+      '<div class="row" style="gap:6px;margin-top:8px"><span class="chip">' + icon('key') + esc(s.code) + '</span><span class="chip gold">' + esc(level(s.level_id).name || 'No level') + '</span>' + (c ? '<span class="chip blue">' + esc(c.name) + '</span>' : '<span class="chip grey">No class</span>') + (s.active ? '' : '<span class="chip red">Not active</span>') + '<select class="chip-select" data-change="studentLang" aria-label="Lesson language">' + Object.keys(I.LANGS).map(function (l) { return opt(l, I.LANGS[l], s.lang || 'en'); }).join('') + '</select><span class="chip grey">Last seen: ' + esc(ago(s.last_seen)) + '</span></div></div>' +
       '<span class="stars-pill">' + icon('star', 'fill') + s.stars + '</span></div>' +
       '<div class="row" style="margin-top:16px;gap:8px"><button class="btn" data-act="assessForm">' + icon('clipboard') + 'Add assessment</button><button class="btn gold" data-act="starsForm">' + icon('star', 'fill') + 'Give stars</button>' +
-      '<button class="btn ghost" data-act="certForm">' + icon('award') + 'Certificate</button><button class="btn ghost" data-act="resetPin" data-id="' + s.id + '">' + icon('key') + 'New PIN</button>' +
-      (s.parent_whatsapp ? '<a class="btn ghost" target="_blank" rel="noopener" href="' + esc(I.waLink(s.parent_whatsapp, reminder)) + '">' + icon('wa') + 'Send parent link</a>' : '') +
-      '<button class="btn ghost" data-act="copy" data-label="Parent link copied" data-text="' + esc(parentLink(s)) + '">' + icon('link') + 'Copy parent link</button>' +
-      (isAdmin ? '<button class="btn ghost" data-act="studentForm" data-id="' + s.id + '">' + icon('edit') + 'Edit</button>' : '') + '</div></section>' +
+      '<button class="btn ghost" data-act="certForm">' + icon('award') + 'Certificate</button>' +
+      '<details class="more"><summary class="btn ghost">' + icon('more') + 'More</summary><div class="menu">' +
+      '<button data-act="studentForm" data-id="' + s.id + '">' + icon('edit') + 'Edit details</button>' +
+      '<button data-act="resetPin" data-id="' + s.id + '">' + icon('key') + 'Make a new PIN</button>' +
+      (s.parent_whatsapp ? '<a target="_blank" rel="noopener" href="' + esc(I.waLink(s.parent_whatsapp, reminder)) + '">' + icon('wa') + 'Send parent link on WhatsApp</a>' : '') +
+      '<button data-act="copy" data-label="Parent link copied" data-text="' + esc(parentLink(s)) + '">' + icon('link') + 'Copy parent link</button></div></details></div></section>' +
 
       '<section class="tiles" style="margin-bottom:18px"><div class="tile"><span class="lbl">' + icon('book') + 'Lessons read</span><b>' + s.lessons_read + ' <span style="font-size:.5em;color:var(--muted)">of ' + s.lessons_total + '</span></b></div>' +
       '<div class="tile"><span class="lbl">' + icon('clipboard') + 'Quiz average</span><b>' + (s.quiz_avg == null ? '—' : s.quiz_avg + '%') + '</b></div>' +
@@ -285,7 +377,7 @@
 
   // ------------------------------------------------------------ classes
   PAGES.classes = function (el) {
-    el.innerHTML = head(isAdmin ? 'Classes' : 'My classes', 'Each class has a level, a teacher and a live-class link.', isAdmin ? '<button class="btn" data-act="classForm">' + icon('plus') + 'New class</button>' : '') +
+    el.innerHTML = head(isAdmin ? 'Classes' : 'My classes', 'Each class has a level, a teacher and a live-class link. Use "Schedule" to set the dates and times.', isAdmin ? '<button class="btn" data-act="classForm">' + icon('plus') + 'New class</button>' : '') +
       (D.classes.length ? '<div class="tiles" style="grid-template-columns:repeat(auto-fill,minmax(290px,1fr))">' + D.classes.map(function (c) {
         var t = teacher(c.teacher_id), link = I.safeUrl(c.meet_link);
         return '<section class="card stack" style="gap:12px"><div class="row"><h2 class="grow" style="font-size:1.35rem;line-height:1.15">' + esc(c.name) + '</h2>' + (c.active ? '' : '<span class="chip grey">Closed</span>') + '</div>' +
@@ -293,8 +385,21 @@
           '<div class="row small" style="flex-wrap:nowrap;align-items:flex-start;gap:10px;color:var(--muted)">' + icon('cap') + '<span><b style="color:var(--ink)">' + esc(t ? t.full_name : 'No teacher yet') + '</b><br>' + esc(c.schedule || 'No timetable yet') + '</span></div>' +
           '<div class="row" style="gap:8px">' + (link ? '<a class="btn sm" href="' + esc(link) + '" target="_blank" rel="noopener">' + icon('video') + 'Start class</a>' : '<span class="chip red">No class link</span>') +
           '<button class="btn soft sm" data-act="toAttendance" data-id="' + c.id + '">Attendance</button><button class="btn soft sm" data-act="toHomework" data-id="' + c.id + '">Homework</button>' +
-          (isAdmin ? '<button class="btn ghost sm" data-act="classForm" data-id="' + c.id + '">' + icon('edit') + 'Edit</button>' : '') + '</div></section>';
+          '<button class="btn soft sm" data-act="meetForm" data-class="' + c.id + '">' + icon('clock') + 'Schedule</button><button class="btn soft sm" data-act="studentForm" data-class="' + c.id + '">' + icon('plus') + 'Student</button>' +
+          (isAdmin ? '<button class="btn ghost sm" data-act="classForm" data-id="' + c.id + '">' + icon('edit') + 'Edit</button>' : '<button class="btn ghost sm" data-act="classLinkForm" data-id="' + c.id + '">' + icon('edit') + 'Link and timetable</button>') + '</div></section>';
       }).join('') + '</div>' : '<div class="card">' + empty('video', isAdmin ? 'No classes yet. Create one to start adding students.' : 'The admin has not given you a class yet.', isAdmin ? '<button class="btn" data-act="classForm">' + icon('plus') + 'New class</button>' : '') + '</div>');
+  };
+  actions.classLinkForm = function (el) {
+    var c = klass(el.dataset.id);
+    modal('<h2>' + esc(c.name) + '</h2><form class="stack" data-form="saveClassLink"><input type="hidden" name="id" value="' + c.id + '">' +
+      '<label class="f">Timetable <span class="hint">Shown to students and parents. Say the time zone.</span><input type="text" name="schedule" value="' + esc(c.schedule) + '" placeholder="Saturday and Sunday, 6:00 PM London time"></label>' +
+      '<label class="f">Class meeting link <span class="hint">Your Zoom, Google Meet or Jitsi link. Used for every class unless you give a class its own link.</span><input type="url" name="meet_link" value="' + esc(c.meet_link) + '" placeholder="https://"></label>' +
+      '<div><button type="button" class="btn soft sm" data-act="jitsiFill">Make a free Jitsi Meet link</button></div>' +
+      '<div class="foot"><button type="button" class="btn ghost" data-act="closeModal">Cancel</button><button class="btn" type="submit">Save</button></div></form>');
+  };
+  actions.jitsiFill = function () { var c = klass(document.querySelector('#modal [name=id]').value) || {}; document.querySelector('#modal [name=meet_link]').value = jitsiLink(c.name); };
+  forms.saveClassLink = function (f, d, btn) {
+    busy(btn, async function () { await rpc('ilm_staff_save_class_link', { p_class: d.id, p_schedule: d.schedule, p_link: d.meet_link }); closeModal(); toast('Class link saved'); await refresh(); });
   };
   actions.toAttendance = function (el) { ui.attClass = el.dataset.id; ui.att = {}; go('attendance'); };
   actions.toHomework = function (el) { ui.hwClass = el.dataset.id; go('homework'); };
@@ -312,6 +417,101 @@
   };
   forms.saveClass = function (f, d, btn) {
     busy(btn, async function () { var id = await rpc('ilm_admin_save_class', { p: d }); closeModal(); toast('Class saved'); if (!ui.attClass) ui.attClass = ui.hwClass = id; await refresh(); });
+  };
+
+
+  // ----------------------------------------------------------- schedule
+  function tzName() { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { return ''; } }
+  function meeting(id) { return D.meetings.filter(function (m) { return m.id === id; })[0]; }
+  PAGES.schedule = function (el) {
+    var list = meetingsLive(), groups = [], last = null;
+    list.forEach(function (m) {
+      var d = new Date(m.starts_at), key = d.toDateString();
+      if (key !== last) { groups.push({ label: I.whenParts(m.starts_at).day, date: fmtDate(d), items: [] }); last = key; }
+      groups[groups.length - 1].items.push(m);
+    });
+    el.innerHTML = head('Schedule', 'Live classes for the next 8 weeks. Students and parents see them on their page with a Join button.', D.classes.length ? '<button class="btn" data-act="meetForm">' + icon('plus') + 'Schedule a class</button>' : '') +
+      (I.push.offer() ? '<section class="card stack" style="margin-bottom:18px;gap:10px"><b>Reminders on this device</b>' + I.remindRow() + '<p class="small muted">10 minutes before each class, a notification goes to you and to every student and parent who switched reminders on. Times are in your time zone (' + esc(tzName()) + '); everyone else sees their own.</p></section>' : '') +
+      (!D.classes.length ? '<div class="card">' + empty('clock', isAdmin ? 'Create a class first, then schedule its live lessons.' : 'The admin has not given you a class yet.') + '</div>'
+        : !list.length ? '<div class="card">' + empty('clock', 'No live classes scheduled yet. Add the date, the time and the Zoom, Google Meet or Jitsi link — it can repeat every week.', '<button class="btn" data-act="meetForm">' + icon('plus') + 'Schedule a class</button>') + '</div>'
+        : groups.map(function (g) {
+          return '<div class="day-h">' + esc(g.label === g.date ? g.label : g.label + (/^(Today|Tomorrow)$/.test(g.label) ? ' · ' + g.date : '')) + '</div>' + g.items.map(function (m) {
+            var st = I.classState(m), w = I.whenParts(m.starts_at), link = I.safeUrl(m.link);
+            return '<div class="meet-row ' + st.state + '"><div class="meet-time"><b>' + esc(w.time) + '</b><span class="small muted">' + m.minutes + ' min</span></div>' +
+              '<div class="grow" style="min-width:180px"><b>' + esc(m.title || m.class_name) + '</b><div class="small muted">' + esc([m.title ? m.class_name : '', isAdmin ? m.teacher : '', m.series ? 'Every week' : ''].filter(Boolean).join(' · ')) + '</div>' +
+              '<span class="countdown" style="margin-top:6px" data-cd-start="' + esc(m.starts_at) + '" data-cd-min="' + m.minutes + '">' + esc(st.text) + '</span></div>' +
+              '<div class="acts">' + (link ? '<a class="btn ' + (st.state === 'later' ? 'soft' : 'gold') + ' sm" href="' + esc(link) + '" target="_blank" rel="noopener">' + icon('video') + 'Start</a>' : '<span class="chip red">No link</span>') +
+              '<button class="btn ghost sm" data-act="copyInvite" data-id="' + m.id + '">' + icon('copy') + 'Invite</button><button class="btn ghost sm" data-act="meetForm" data-id="' + m.id + '">' + icon('edit') + 'Edit</button></div></div>';
+          }).join('');
+        }).join(''));
+    I.paintRemind();
+  };
+  actions.copyInvite = function (el) {
+    var m = meeting(el.dataset.id); if (!m) return;
+    var w = I.whenParts(m.starts_at), d = new Date(m.starts_at);
+    var text = 'Assalamu alaykum! Live class: ' + [m.title, m.class_name].filter(Boolean).join(' — ') + '\n' +
+      (/^(Today|Tomorrow)$/.test(w.day) ? w.day + ', ' : '') + fmtDate(d) + ' at ' + w.time + ' (' + tzName() + ' time)' + '\n' +
+      (I.safeUrl(m.link) ? 'Join here: ' + m.link + '\n' : '') + '\nThe exact time in your country and a reminder 10 minutes before are on the portal: ' + portal();
+    I.copyText(text, 'Invitation');
+  };
+  function jitsiLink(className) {
+    var slug = String(className || 'class').normalize('NFKD').replace(/[^A-Za-z0-9]+/g, '').slice(0, 18) || 'Class';
+    var r = ''; var a = new Uint8Array(6); crypto.getRandomValues(a); a.forEach(function (x) { r += 'abcdefghjkmnpqrstuvwxyz23456789'.charAt(x % 31); });
+    return 'https://meet.jit.si/ILM-' + slug + '-' + r;
+  }
+  function pad(n) { return String(n).padStart(2, '0'); }
+  actions.meetForm = function (el) {
+    var m = el.dataset.id ? meeting(el.dataset.id) : null;
+    var cls = D.classes.filter(function (c) { return c.active; });
+    if (!cls.length) return toast('Create a class first.', 'bad');
+    var classId = m ? m.class_id : (el.dataset.class || (cls[0] && cls[0].id));
+    var start = m ? new Date(m.starts_at) : (function () { var d = new Date(Date.now() + 3600e3); d.setMinutes(0, 0, 0); return d; })();
+    var dateV = start.getFullYear() + '-' + pad(start.getMonth() + 1) + '-' + pad(start.getDate()), timeV = pad(start.getHours()) + ':' + pad(start.getMinutes());
+    var c0 = klass(classId) || {}, how = m ? (m.own_link ? 'paste' : 'class') : (I.safeUrl(c0.meet_link) ? 'class' : 'paste');
+    modal('<h2>' + (m ? 'Edit live class' : 'Schedule a live class') + '</h2><form class="stack" data-form="saveMeet">' + (m ? '<input type="hidden" name="id" value="' + m.id + '">' : '') +
+      '<div class="grid2"><label class="f">Class<select name="class_id" id="mfClass"' + (m ? ' disabled' : '') + '>' + cls.map(function (c) { return opt(c.id, c.name, classId); }).join('') + '</select></label>' +
+      '<label class="f">What is the class about? <span class="hint">Optional</span><input type="text" name="title" maxlength="100" value="' + esc(m ? m.title : '') + '" placeholder="Surah Al-Fatiha"></label></div>' +
+      '<div class="grid3"><label class="f">Date<input type="date" name="date" value="' + dateV + '" required></label><label class="f">Start time<input type="time" name="time" value="' + timeV + '" required></label>' +
+      '<label class="f">Length<select name="minutes">' + [30, 40, 45, 60, 75, 90, 120].map(function (n) { return opt(n, n + ' minutes', m ? m.minutes : 45); }).join('') + '</select></label></div>' +
+      (m ? (m.series ? '<div class="pick-cards"><label><input type="radio" name="scope" value="one" checked><span>Change only this class</span></label><label><input type="radio" name="scope" value="series"><span>Change this and every later class in the series<small>The same change in time is applied to each one.</small></span></label></div>' : '')
+        : '<label class="f">Repeat<select name="repeat">' + opt(1, 'Only once', 1) + [4, 8, 12, 26].map(function (n) { return opt(n, 'Every week, ' + n + ' times', 1); }).join('') + '</select></label>') +
+      '<div class="f"><span style="font-weight:700;font-size:.9rem">Meeting link</span><div class="pick-cards" id="mfHow">' +
+      '<label><input type="radio" name="how" value="class"' + (how === 'class' ? ' checked' : '') + '><span>Use the class link<small id="mfClassLink">' + esc(I.safeUrl(c0.meet_link) || 'This class has no link yet — paste one below or make a free room.') + '</small></span></label>' +
+      '<label><input type="radio" name="how" value="paste"' + (how === 'paste' ? ' checked' : '') + '><span>Paste a Zoom or Google Meet link<input type="url" name="link" placeholder="https://" value="' + esc(m && m.own_link ? m.link : '') + '" style="margin-top:8px"></span></label>' +
+      '<label><input type="radio" name="how" value="jitsi"><span>Make a free Jitsi Meet room<small>Free, no app needed, up to 95 minutes. Whoever opens it first may be asked to sign in with Google, GitHub or Facebook — so open it yourself a few minutes early.</small></span></label></div></div>' +
+      '<label class="f">Note for students <span class="hint">Optional. For example "Bring your Qur\'an"</span><input type="text" name="note" maxlength="300" value="' + esc(m ? m.note : '') + '"></label>' +
+      '<p class="small muted">Times are in your time zone (' + esc(tzName()) + '). Students and parents see the class in their own time, with a reminder 10 minutes before.</p>' +
+      '<div class="foot">' + (m ? '<button type="button" class="btn danger" data-act="meetDelete" data-id="' + m.id + '">' + icon('trash') + 'Delete</button><span class="grow"></span>' : '') + '<button type="button" class="btn ghost" data-act="closeModal">Cancel</button><button class="btn" type="submit">' + (m ? 'Save changes' : 'Schedule') + '</button></div></form>', true);
+    var sel = document.getElementById('mfClass');
+    sel.addEventListener('change', function () { var c = klass(sel.value) || {}; document.getElementById('mfClassLink').textContent = I.safeUrl(c.meet_link) || 'This class has no link yet — paste one below or make a free room.'; });
+    document.querySelector('#modal input[name=link]').addEventListener('focus', function () { document.querySelector('#modal input[name=how][value=paste]').checked = true; });
+  };
+  forms.saveMeet = function (f, d, btn) {
+    var c = klass(d.class_id || (meeting(d.id) || {}).class_id) || {}, link = '';
+    if (d.how === 'paste') { link = d.link; if (!/^https?:\/\//i.test(link || '')) return toast('Paste the meeting link (it starts with https://).', 'bad'); }
+    else if (d.how === 'jitsi') link = jitsiLink(c.name);
+    else if (!I.safeUrl(c.meet_link)) return toast('This class has no link yet. Paste a link or choose the free Jitsi room.', 'bad');
+    var parts = d.date.split('-').map(Number), hm = d.time.split(':').map(Number);
+    var at = function (week) { return new Date(parts[0], parts[1] - 1, parts[2] + 7 * week, hm[0], hm[1]).toISOString(); };
+    busy(btn, async function () {
+      if (d.id) await rpc('ilm_staff_save_meeting', { p: { id: d.id, title: d.title, starts_at: at(0), minutes: Number(d.minutes), link: link, note: d.note, scope: d.scope || 'one' } });
+      else {
+        var weeks = Number(d.repeat) || 1, starts = []; for (var i = 0; i < weeks; i++) starts.push(at(i));
+        var n = await rpc('ilm_staff_save_meeting', { p: { class_id: d.class_id, title: d.title, starts: starts, minutes: Number(d.minutes), link: link, note: d.note } });
+        toast(n === 1 ? 'Class scheduled' : n + ' classes scheduled');
+      }
+      closeModal(); if (d.id) toast('Saved');
+      if (d.how === 'jitsi') toast('Free room ready. Open "Start" a few minutes early.');
+      page = page === 'overview' ? 'overview' : 'schedule'; await refresh();
+    });
+  };
+  actions.meetDelete = function (el) {
+    var m = meeting(el.dataset.id);
+    modal('<h2>Delete this class?</h2><p><b>' + esc([m.title, m.class_name].filter(Boolean).join(' · ')) + '</b> · ' + esc(I.whenParts(m.starts_at).day) + ' ' + esc(I.whenParts(m.starts_at).time) + '</p><p class="muted">Students will no longer see it. Tell them in your class group if they were expecting it.</p>' +
+      '<div class="foot"><button class="btn ghost" data-act="closeModal">Keep it</button>' + (m.series ? '<button class="btn danger" data-act="meetDeleteYes" data-id="' + m.id + '" data-series="1">This and all later ones</button>' : '') + '<button class="btn danger" data-act="meetDeleteYes" data-id="' + m.id + '">Delete ' + (m.series ? 'only this one' : '') + '</button></div>');
+  };
+  actions.meetDeleteYes = function (el) {
+    busy(el, async function () { var n = await rpc('ilm_staff_delete_meeting', { p_id: el.dataset.id, p_series: !!el.dataset.series }); closeModal(); toast(n === 1 ? 'Class deleted' : n + ' classes deleted'); await refresh(); });
   };
 
   // --------------------------------------------------------- attendance
@@ -410,7 +610,7 @@
     el.innerHTML = head('Syllabus', 'Three levels, written for how children learn at each age.', isAdmin ? '<button class="btn" data-act="unitForm">' + icon('plus') + 'Add unit</button>' : '') +
       '<div class="toolbar"><div class="seg">' + ui.syllabus.map(function (l) { return '<button data-act="sylLevel" data-id="' + l.id + '" aria-pressed="' + (l.id === lv.id) + '">' + esc(l.name) + ' · ' + l.age_min + '–' + l.age_max + '</button>'; }).join('') + '</div></div>' +
       '<section class="card" style="background:var(--teal-d);color:#fff;position:relative;overflow:hidden;margin-bottom:14px">' + I.pattern() + '<div class="row" style="position:relative;align-items:flex-start"><div class="ar" lang="ar" style="font-size:3rem;color:var(--gold);line-height:1.2">' + esc(lv.arabic) + '</div><div class="grow"><h2 style="font-size:1.6rem">' + esc(lv.name) + ' · ages ' + lv.age_min + '–' + lv.age_max + '</h2><p style="color:#CFE5DF">' + esc(lv.about) + '</p><p class="small" style="color:var(--gold);margin-top:6px">' + lv.units.length + ' units · ' + lessons + ' lessons · a quiz after every lesson · an exam after every unit</p></div></div></section>' +
-      '<details class="acc" style="margin-bottom:14px"><summary><span class="unit-n" style="background:var(--gold-l);color:var(--gold-d)">' + icon('heart') + '</span><span class="grow"><b>' + esc(psy[0] || 'How children this age learn') + '</b><span class="small muted" style="display:block">Read this before you teach the level</span></span>' + icon('chev', 'chev') + '</summary><div class="body"><ul style="margin:0;padding-left:20px;display:grid;gap:8px">' + psy.slice(1).map(function (p) { return '<li>' + esc(p.replace(/^- /, '')) + '</li>'; }).join('') + '</ul></div></details>' +
+      '<details class="acc" style="margin-bottom:14px"><summary><span class="unit-n" style="background:var(--gold-l);color:var(--gold-d)">' + icon('heart') + '</span><span class="grow"><b>' + esc(psy[0] || 'How children this age learn') + '</b><span class="small muted" style="display:block">Read this before you teach the level</span></span>' + icon('chev', 'chev') + '</summary><div class="body"><ul style="margin:0;padding-left:20px;display:grid;gap:8px">' + psy.slice(1).map(function (p) { return '<li>' + esc(p.replace(/^- /, '')) + '</li>'; }).join('') + '</ul></div></details>' + languagesCard() +
       lv.units.map(function (u, i) {
         return '<details class="acc"' + (i === 0 ? ' open' : '') + '><summary><span class="unit-n">' + (i + 1) + '</span><span class="grow"><b>' + esc(u.title) + '</b><span class="small muted" style="display:block">' + esc(u.summary || '') + '</span></span><span class="chip">' + u.lessons.length + ' lessons</span>' + icon('chev', 'chev') + '</summary><div class="body">' +
           (u.goal ? '<p class="info"><b>Goal:</b> ' + esc(u.goal) + '</p>' : '') +
@@ -423,18 +623,96 @@
   actions.sylLevel = function (el) { ui.level = Number(el.dataset.id); PAGES.syllabus(document.getElementById('main')); };
   function findLesson(id) { var out = null; ui.syllabus.forEach(function (lv) { lv.units.forEach(function (u) { u.lessons.forEach(function (l) { if (String(l.id) === String(id)) out = l; }); }); }); return out; }
   function findUnit(id) { var out = null; ui.syllabus.forEach(function (lv) { lv.units.forEach(function (u) { if (String(u.id) === String(id)) out = u; }); }); return out; }
-  actions.lessonView = function (el) {
-    var l = findLesson(el.dataset.id);
-    modal('<div class="row"><h2 class="grow">' + esc(l.title) + '</h2><button class="btn ghost sm" data-act="closeModal" aria-label="Close">' + icon('x') + '</button></div>' +
-      (l.teacher_note ? '<div class="note"><b>Teaching tip:</b> ' + esc(l.teacher_note) + '</div>' : '') +
-      (l.hook ? '<p class="serif" style="font-size:1.3rem;color:var(--teal-d)">' + esc(l.hook) + '</p>' : '') +
-      '<div class="slide" style="box-shadow:none;padding:0;animation:none;max-width:none">' + I.bodyBlocks(l.body).join('') + '</div>' +
-      (l.arabic ? '<div class="phrase">' + I.pattern() + '<div class="ar" lang="ar" style="font-size:2rem">' + esc(l.arabic) + '</div><div class="tr">' + esc(l.translit || '') + '</div><div class="mn">' + esc(l.meaning || '') + '</div></div>' : '') +
-      (l.action ? '<div class="todo">' + icon('sun') + '<p><b>Try it today:</b> ' + esc(l.action) + '</p></div>' : '') +
-      '<h3>Quiz</h3>' + (l.questions.length ? l.questions.map(function (q, n) {
-        return '<div class="review-item" style="background:var(--bg)"><b>' + (n + 1) + '. ' + esc(q.prompt) + '</b>' + q.options.map(function (o, k) { return '<span class="ans">' + (k === q.answer ? '<b style="color:var(--green)">✓ ' + esc(o) + '</b>' : '○ ' + esc(o)) + '</span>'; }).join('') + (q.explain ? '<span class="ans muted">' + esc(q.explain) + '</span>' : '') + '</div>';
-      }).join('') : '<p class="muted">No quiz questions yet.</p>'), true);
+  // ---- languages: which lessons are translated, installing a language pack, editing a translation
+  var viewLang = 'en';
+  function allLessons() { var out = []; ui.syllabus.forEach(function (lv) { lv.units.forEach(function (u) { u.lessons.forEach(function (l) { out.push(l); }); }); }); return out; }
+  function hasTr(l, lang) { return !!(l.i18n && l.i18n[lang] && l.i18n[lang].body); }
+  function languagesCard() {
+    var all = allLessons();
+    return '<details class="acc" style="margin-bottom:14px"><summary><span class="unit-n" style="background:var(--blue-l);color:#154C6E">' + icon('globe') + '</span><span class="grow"><b>Languages</b><span class="small muted" style="display:block">' +
+      ['ml', 'tr', 'ar'].map(function (l) { return I.LANGS[l] + ' ' + all.filter(function (x) { return hasTr(x, l); }).length + '/' + all.length; }).join(' · ') + '</span></span>' + icon('chev', 'chev') + '</summary><div class="body">' +
+      '<p class="small muted">Lessons are written in English. Each student sees them in the language chosen on their profile; a lesson that is not translated yet is shown in English.</p><div class="list">' +
+      ['ml', 'tr', 'ar'].map(function (l) {
+        var n = all.filter(function (x) { return hasTr(x, l); }).length;
+        return '<div class="li"><span class="grow"><b>' + esc(I.LANGS[l]) + '</b><span class="small muted" style="display:block">' + n + ' of ' + all.length + ' lessons translated</span></span>' +
+          (n >= all.length ? '<span class="chip green">' + icon('check') + 'Ready</span>' : '') +
+          (isAdmin ? '<button class="btn ' + (n >= all.length ? 'ghost' : '') + ' sm" data-act="langInstall" data-lang="' + l + '"' + (n >= all.length ? ' data-overwrite="1"' : '') + '>' + (n >= all.length ? 'Reinstall' : n ? 'Add the missing ones' : 'Install') + '</button>' : '') + '</div>';
+      }).join('') + '</div>' + (isAdmin ? '<p class="small muted">"Install" fills in translations that are missing and never touches ones you have corrected. To correct a translation, open a lesson, pick the language and press "Edit translation".</p>' : '') + '</div></details>';
+  }
+  actions.langInstall = function (el) {
+    var lang = el.dataset.lang;
+    if (el.dataset.overwrite && !el.dataset.sure) {
+      return modal('<h2>Reinstall ' + esc(I.LANGS[lang]) + '?</h2><p>This puts back the original translation for every lesson and <b>replaces any corrections you made</b> in this language.</p><div class="foot"><button class="btn ghost" data-act="closeModal">Cancel</button><button class="btn danger" data-act="langInstall" data-lang="' + lang + '" data-overwrite="1" data-sure="1">Replace with the original</button></div>');
+    }
+    busy(el, async function () {
+      var res = await fetch('lang-' + lang + '.json', { cache: 'no-store' });
+      if (!res.ok) throw new Error('The language file lang-' + lang + '.json was not found on the website. Upload it with the other files and try again.');
+      var out = await rpc('ilm_admin_load_language', { p_lang: lang, p_data: await res.json(), p_overwrite: !!el.dataset.overwrite });
+      closeModal(); toast(I.LANGS[lang] + ': ' + out.lessons + ' lessons and ' + out.questions + ' quiz questions added');
+      ui.syllabus = null; PAGES.syllabus(document.getElementById('main'));
+    });
   };
+  function trOf(obj, lang, key) { return (lang !== 'en' && obj.i18n && obj.i18n[lang] && obj.i18n[lang][key]) || obj[key]; }
+  function trOpts(q, lang) { var o = lang !== 'en' && q.i18n && q.i18n[lang] && q.i18n[lang].options; return o && o.length === q.options.length ? o : q.options; }
+  actions.lessonView = function (el) {
+    var l = findLesson(el.dataset.id), lang = el.dataset.lang || 'en', rtl = lang === 'ar';
+    viewLang = lang;
+    modal('<div class="row"><h2 class="grow" dir="auto">' + esc(trOf(l, lang, 'title')) + '</h2><button class="btn ghost sm" data-act="closeModal" aria-label="Close">' + icon('x') + '</button></div>' +
+      '<div class="row"><div class="seg">' + Object.keys(I.LANGS).map(function (k) { return '<button data-act="lessonView" data-id="' + l.id + '" data-lang="' + k + '" aria-pressed="' + (k === lang) + '">' + esc(I.LANGS[k]) + '</button>'; }).join('') + '</div>' +
+      (lang !== 'en' && !hasTr(l, lang) ? '<span class="chip red">Not translated yet — students see English</span>' : '') +
+      (isAdmin && lang !== 'en' ? '<button class="btn soft sm" data-act="trForm" data-id="' + l.id + '" data-lang="' + lang + '">' + icon('edit') + 'Edit translation</button>' : '') + '</div>' +
+      (l.teacher_note ? '<div class="note"><b>Teaching tip:</b> ' + esc(l.teacher_note) + '</div>' : '') +
+      '<div class="stack" lang="' + lang + '" dir="' + (rtl ? 'rtl' : 'ltr') + '">' +
+      (l.hook ? '<p class="serif" style="font-size:1.3rem;color:var(--teal-d)">' + esc(trOf(l, lang, 'hook')) + '</p>' : '') +
+      '<div class="slide" style="box-shadow:none;padding:0;animation:none;max-width:none">' + I.bodyBlocks(trOf(l, lang, 'body')).join('') + '</div>' +
+      (l.arabic ? '<div class="phrase">' + I.pattern() + '<div class="ar" lang="ar" style="font-size:2rem">' + esc(l.arabic) + '</div><div class="tr" dir="ltr">' + esc(l.translit || '') + '</div><div class="mn">' + esc(trOf(l, lang, 'meaning') || '') + '</div></div>' : '') +
+      (l.action ? '<div class="todo">' + icon('sun') + '<p>' + esc(trOf(l, lang, 'action')) + '</p></div>' : '') +
+      '<h3>Quiz</h3>' + (l.questions.length ? l.questions.map(function (q, n) {
+        var o = trOpts(q, lang);
+        return '<div class="review-item" style="background:var(--bg)"><b>' + (n + 1) + '. ' + esc(trOf(q, lang, 'prompt')) + '</b>' + o.map(function (x, k) { return '<span class="ans">' + (k === q.answer ? '<b style="color:var(--green)">✓ ' + esc(x) + '</b>' : '○ ' + esc(x)) + '</span>'; }).join('') + (q.explain ? '<span class="ans muted">' + esc(trOf(q, lang, 'explain')) + '</span>' : '') + '</div>';
+      }).join('') : '<p class="muted">No quiz questions yet.</p>') + '</div>', true);
+  };
+  actions.trForm = function (el) {
+    var l = findLesson(el.dataset.id), lang = el.dataset.lang, tr = (l.i18n && l.i18n[lang]) || {}, dir = lang === 'ar' ? 'rtl' : 'ltr';
+    var field = function (label, name, src, val, big) {
+      return src ? '<label class="f">' + label + '<div class="tr-src">' + esc(src) + '</div>' + (big ? '<textarea name="' + name + '" lang="' + lang + '" dir="' + dir + '" style="min-height:200px">' + esc(val) + '</textarea>' : '<input type="text" name="' + name + '" lang="' + lang + '" dir="' + dir + '" value="' + esc(val) + '">') + '</label>' : '';
+    };
+    modal('<h2>' + esc(I.LANGS[lang]) + ' translation</h2><p class="muted">The grey box is the English original. Write the ' + esc(I.LANGS[lang]) + ' text under it. Anything left empty is shown to students in English.</p>' +
+      '<form class="stack" data-form="saveTr"><input type="hidden" name="id" value="' + l.id + '"><input type="hidden" name="lang" value="' + lang + '">' +
+      field('Lesson title', 'title', l.title, tr.title) + field('Opening question', 'hook', l.hook, tr.hook) + field('Lesson text', 'body', l.body, tr.body, true) +
+      field('Meaning of the Arabic phrase', 'meaning', l.meaning, tr.meaning) + field('Try it today', 'action', l.action, tr.action) +
+      (l.questions.length ? '<h3>Quiz questions</h3>' : '') + l.questions.map(function (q, n) {
+        var qt = (q.i18n && q.i18n[lang]) || {}, qo = qt.options && qt.options.length === q.options.length ? qt.options : [];
+        return '<fieldset class="card flat stack trq" data-q="' + q.id + '" style="padding:14px;gap:10px"><legend class="small" style="font-weight:800;padding:0 6px">Question ' + (n + 1) + '</legend>' +
+          '<div class="tr-src">' + esc(q.prompt) + '</div><input type="text" class="t-prompt" lang="' + lang + '" dir="' + dir + '" value="' + esc(qt.prompt) + '" aria-label="Question ' + (n + 1) + '">' +
+          q.options.map(function (o, k) { return '<label class="row nw" style="gap:8px"><span class="chip ' + (k === q.answer ? 'green' : 'grey') + '" style="flex:0 0 34%;white-space:normal">' + (k === q.answer ? '✓ ' : '') + esc(o) + '</span><input type="text" class="t-opt" lang="' + lang + '" dir="' + dir + '" value="' + esc(qo[k]) + '" aria-label="Answer ' + (k + 1) + '"></label>'; }).join('') +
+          (q.explain ? '<div class="tr-src">' + esc(q.explain) + '</div><input type="text" class="t-explain" lang="' + lang + '" dir="' + dir + '" value="' + esc(qt.explain) + '" aria-label="Explanation">' : '') + '</fieldset>';
+      }).join('') +
+      '<div class="foot"><button type="button" class="btn ghost" data-act="lessonView" data-id="' + l.id + '" data-lang="' + lang + '">Cancel</button><button class="btn" type="submit">Save translation</button></div></form>', true);
+  };
+  forms.saveTr = function (f, d, btn) {
+    var questions = [];
+    f.querySelectorAll('.trq').forEach(function (row) {
+      var opts = []; row.querySelectorAll('.t-opt').forEach(function (o) { opts.push(o.value.trim()); });
+      var ex = row.querySelector('.t-explain');
+      questions.push({ id: Number(row.dataset.q), prompt: row.querySelector('.t-prompt').value.trim(), options: opts, explain: ex ? ex.value.trim() : '' });
+    });
+    busy(btn, async function () {
+      await rpc('ilm_admin_save_translation', { p_lesson: Number(d.id), p_lang: d.lang, p: { title: d.title, hook: d.hook, body: d.body, meaning: d.meaning, action: d.action, questions: questions } });
+      ui.syllabus = await rpc('ilm_syllabus'); toast('Translation saved');
+      PAGES.syllabus(document.getElementById('main'));
+      var b = document.createElement('button'); b.dataset.id = d.id; b.dataset.lang = d.lang; actions.lessonView(b);
+    });
+  };
+  document.addEventListener('change', function (e) {
+    if (!e.target.matches || !e.target.matches('[data-change=studentLang]')) return;
+    var lang = e.target.value;
+    rpc('ilm_staff_set_lang', { p_student: T.student.id, p_lang: lang }).then(function () {
+      T.student.lang = lang; var s = student(T.student.id); if (s) s.lang = lang;
+      toast(I.firstName(T.student.full_name) + '\'s lessons are now in ' + I.LANGS[lang]);
+    }).catch(I.fail);
+  });
+
   function qEditor(q, n) {
     q = q || { options: ['', '', ''], answer: 0 };
     var o = q.options.concat(['', '', '', '']).slice(0, 4);
@@ -576,13 +854,88 @@
     csvDownload('ilm-fees.csv', rows);
   };
 
+
+  // ------------------------------------------------------------ profile
+  PAGES.profile = function (el) {
+    ui.photo = undefined;
+    el.innerHTML = head('My profile', 'Students and parents see your photo, your name and the few words about you.') +
+      '<div class="cols"><form class="card stack" data-form="saveProfile"><h2 style="font-size:1.4rem">About me</h2>' +
+      '<div class="photo-pick"><span id="photoBox">' + avatar(me.full_name, 5, 'xl', me.photo) + '</span><div class="stack" style="gap:8px">' +
+      '<label class="btn soft" style="cursor:pointer">' + icon('camera') + (me.photo ? 'Change photo' : 'Add a photo') + '<input type="file" id="photoFile" accept="image/*" hidden></label>' +
+      (me.photo ? '<button type="button" class="btn ghost sm" data-act="photoRemove">Remove photo</button>' : '') + '<span class="small muted">A clear, friendly face photo works best.</span></div></div>' +
+      '<label class="f">Your name <span class="hint">As students should call you, for example "Ustadha Amina"</span><input type="text" name="full_name" maxlength="80" value="' + esc(me.full_name) + '" required></label>' +
+      '<div class="grid2"><label class="f">Email <span class="hint">You sign in with this</span><input type="email" name="email" value="' + esc(me.email) + '" autocomplete="email" required></label>' +
+      '<label class="f">WhatsApp number <span class="hint">With country code. Only the admin sees it.</span><input type="tel" name="phone" value="' + esc(me.phone) + '" placeholder="+91 98765 43210"></label></div>' +
+      '<label class="f">A few words about you <span class="hint">Shown to parents. For example what you teach and for how long.</span><textarea name="about" maxlength="400" placeholder="I teach Qur\'an recitation and tajweed to children. I have been teaching for 8 years.">' + esc(me.about) + '</textarea></label>' +
+      '<div class="foot" style="display:flex;justify-content:flex-end"><button class="btn" type="submit">Save my profile</button></div></form>' +
+      '<div class="stack"><form class="card stack" data-form="savePassword"><h2 style="font-size:1.4rem">Password</h2>' +
+      '<label class="f">New password <span class="hint">At least 6 characters</span><input type="password" name="password" minlength="6" autocomplete="new-password" required></label>' +
+      '<label class="f">Type it again<input type="password" name="password2" minlength="6" autocomplete="new-password" required></label>' +
+      '<div class="foot" style="display:flex;justify-content:flex-end"><button class="btn ghost" type="submit">Change password</button></div></form>' +
+      (I.push.offer() ? '<section class="card stack" style="gap:10px"><h2 style="font-size:1.4rem">Class reminders</h2>' + I.remindRow() + '<p class="small muted">Switch this on on each phone or computer where you want the reminder.</p></section>' : '') +
+      '<section class="card"><button class="btn ghost block" data-act="staffLogout">' + icon('logout') + 'Sign out</button></section></div></div>';
+    document.getElementById('photoFile').addEventListener('change', function (e) {
+      var file = e.target.files && e.target.files[0]; if (!file) return;
+      squarePhoto(file).then(function (url) {
+        ui.photo = url;
+        document.getElementById('photoBox').innerHTML = avatar(me.full_name, 5, 'xl', url);
+        toast('Photo ready — press "Save my profile"');
+      }).catch(function () { toast('That picture could not be opened. Please choose a JPG or PNG photo.', 'bad'); });
+    });
+    I.paintRemind();
+  };
+  // crop to a square in the middle and shrink, so the photo stays small and quick to load
+  function squarePhoto(file) {
+    return new Promise(function (ok, no) {
+      var img = new Image(), url = URL.createObjectURL(file);
+      img.onload = function () {
+        var side = Math.min(img.naturalWidth, img.naturalHeight), out = '';
+        [[240, .85], [200, .75], [160, .7]].some(function (t) {
+          var c = document.createElement('canvas'); c.width = c.height = t[0];
+          var g = c.getContext('2d'); g.fillStyle = '#fff'; g.fillRect(0, 0, t[0], t[0]);
+          g.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side, 0, 0, t[0], t[0]);
+          out = c.toDataURL('image/jpeg', t[1]);
+          return out.length < 60000;
+        });
+        URL.revokeObjectURL(url); ok(out);
+      };
+      img.onerror = function () { URL.revokeObjectURL(url); no(); };
+      img.src = url;
+    });
+  }
+  actions.photoRemove = function () { ui.photo = ''; document.getElementById('photoBox').innerHTML = avatar(me.full_name, 5, 'xl'); toast('Photo removed — press "Save my profile"'); };
+  forms.saveProfile = function (f, d, btn) {
+    busy(btn, async function () {
+      var note = '';
+      if (d.email && d.email.toLowerCase() !== String(me.email || '').toLowerCase()) {
+        var out = await I.sb.auth.updateUser({ email: d.email });
+        if (out.error) throw new Error(/already been registered|exists/i.test(out.error.message || '') ? 'Another account already uses this email.' : out.error.message);
+        if (out.data && out.data.user && String(out.data.user.email).toLowerCase() !== d.email.toLowerCase()) note = 'Please open the email we sent to ' + d.email + ' to confirm the change.';
+      }
+      var p = { full_name: d.full_name, phone: d.phone, about: d.about };
+      if (ui.photo !== undefined) p.photo = ui.photo;
+      await rpc('ilm_staff_save_profile', { p: p });
+      await load(); ui.photo = undefined;
+      toast(note || 'Profile saved'); render();
+    });
+  };
+  forms.savePassword = function (f, d, btn) {
+    if (d.password !== d.password2) return toast('The two passwords are not the same.', 'bad');
+    busy(btn, async function () {
+      var out = await I.sb.auth.updateUser({ password: d.password });
+      if (out.error) throw new Error(/at least 6|Password should/i.test(out.error.message || '') ? 'Please choose a password with at least 6 characters.' : /different from the old/i.test(out.error.message || '') ? 'Please choose a password different from the old one.' : out.error.message);
+      f.reset(); toast('Your new password is saved.');
+    });
+  };
+
   // ----------------------------------------------------------- teachers
   PAGES.teachers = function (el) {
     if (!isAdmin) return go('overview');
     el.innerHTML = head('Teachers', 'Teachers create their own account on the login page. You approve them here.', '<button class="btn ghost" data-act="copy" data-label="Invitation copied" data-text="' + esc('Assalamu alaykum. Please create your teacher account for the ILM International portal here: ' + portal() + '\nChoose "Teacher / Admin", then "Create an account". I will approve it straight away.') + '">' + icon('copy') + 'Copy invitation message</button>') +
       '<div class="tablewrap"><table class="t"><thead><tr><th>Name</th><th>Role</th><th>Classes</th><th>Status</th><th>Actions</th></tr></thead><tbody>' + D.teachers.map(function (t) {
         var n = D.classes.filter(function (c) { return c.teacher_id === t.id; }).length, self = t.id === me.id;
-        return '<tr><td><div class="row" style="flex-wrap:nowrap">' + avatar(t.full_name, 2, 'sm') + '<div><b>' + esc(t.full_name) + '</b>' + (self ? ' <span class="chip grey">You</span>' : '') + '<div class="small muted">' + esc(t.email || '') + '</div></div></div></td><td>' + (t.role === 'admin' ? '<span class="chip gold">Admin</span>' : '<span class="chip">Teacher</span>') + '</td><td>' + n + '</td><td>' + (t.approved ? '<span class="chip green">' + icon('check') + 'Approved</span>' : '<span class="chip red">Waiting</span>') + '</td>' +
+        return '<tr><td><div class="row" style="flex-wrap:nowrap">' + avatar(t.full_name, 2, 'sm', t.photo) + '<div><b>' + esc(t.full_name) + '</b>' + (self ? ' <span class="chip grey">You</span>' : '') + '<div class="small muted">' + esc(t.email || '') + '</div>' +
+          (t.phone ? '<a class="small" target="_blank" rel="noopener" href="' + esc(I.waLink(t.phone, 'Assalamu alaykum ' + I.firstName(t.full_name) + ',')) + '">' + esc(t.phone) + '</a>' : '') + '</div></div></td><td>' + (t.role === 'admin' ? '<span class="chip gold">Admin</span>' : '<span class="chip">Teacher</span>') + '</td><td>' + n + '</td><td>' + (t.approved ? '<span class="chip green">' + icon('check') + 'Approved</span>' : '<span class="chip red">Waiting</span>') + '</td>' +
           '<td>' + (self ? '' : '<div class="row" style="gap:6px;flex-wrap:nowrap">' + (t.approved ? '<button class="btn danger sm" data-act="setTeacher" data-id="' + t.id + '" data-approved="false" data-role="' + t.role + '">Remove access</button>' : '<button class="btn sm" data-act="approveTeacher" data-id="' + t.id + '">Approve</button>') +
             (t.approved ? '<button class="btn ghost sm" data-act="setTeacher" data-id="' + t.id + '" data-approved="true" data-role="' + (t.role === 'admin' ? 'teacher' : 'admin') + '">' + (t.role === 'admin' ? 'Make teacher' : 'Make admin') + '</button>' : '') + '</div>') + '</td></tr>';
       }).join('') + '</tbody></table></div>';
@@ -628,6 +981,7 @@
     });
   };
 
+  document.addEventListener('click', function (e) { document.querySelectorAll('details.more[open]').forEach(function (d) { if (!d.contains(e.target) || e.target.closest('.menu')) d.removeAttribute('open'); }); });
   // keyboard: Enter on a table row opens it
   document.addEventListener('keydown', function (e) { if (e.key === 'Enter' && e.target.matches && e.target.matches('tr.click')) e.target.click(); });
 

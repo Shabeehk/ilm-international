@@ -13,11 +13,29 @@
     ],
     "headers": [
       {
-        "source": "**/*.@(css|js|svg)",
+        "source": "**/*.html",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "no-cache"
+          }
+        ]
+      },
+      {
+        "source": "**/*.@(css|js|svg|json)",
         "headers": [
           {
             "key": "Cache-Control",
             "value": "public, max-age=600"
+          }
+        ]
+      },
+      {
+        "source": "@(sw.js|manifest.webmanifest)",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "no-cache"
           }
         ]
       }

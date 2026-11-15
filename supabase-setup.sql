@@ -1192,25 +1192,6 @@ begin
   return jsonb_build_object('ok', i.id is not null and i.status = 'paid', 'invoice', i.id);
 end $$;
 
--- ------------------------------------------------------------ permissions
-do $$
-declare f record;
-begin
-  for f in select p.oid::regprocedure as sig, p.proname from pg_proc p
-            join pg_namespace n on n.oid = p.pronamespace
-           where n.nspname = 'public' and p.proname like 'ilm\_%' loop
-    execute format('revoke all on function %s from public, anon, authenticated', f.sig);
-    if f.proname like 'ilm\_\_%' then
-      null;                                                   -- internal helpers: nobody
-    elsif f.proname like 'ilm\_pay\_%' then
-      execute format('grant execute on function %s to service_role', f.sig);
-    elsif f.proname like 'ilm\_student\_%' or f.proname = 'ilm_parent_report' then
-      execute format('grant execute on function %s to anon, authenticated', f.sig);
-    else
-      execute format('grant execute on function %s to authenticated', f.sig);
-    end if;
-  end loop;
-end $$;
 
 -- ------------------------------------------------------------- syllabus
 -- Loads the three levels, their units, lessons and quiz questions.
@@ -1247,5 +1228,937 @@ begin
     end loop;
   end loop;
 end $seed$;
+
+-- =====================================================================
+--  LANGUAGES — English (en), Malayalam (ml), Turkish (tr), Arabic (ar)
+--  Every student has a language. The teacher or admin sets it and the
+--  student can change it. Lessons, quizzes and exams follow it; anything
+--  not translated yet is shown in English.
+-- =====================================================================
+alter table ilm_students add column if not exists lang text not null default 'en';
+alter table ilm_levels add column if not exists i18n jsonb;
+alter table ilm_units add column if not exists i18n jsonb;
+alter table ilm_lessons add column if not exists i18n jsonb;
+alter table ilm_questions add column if not exists i18n jsonb;
+alter table ilm_certificates add column if not exists unit_id int references ilm_units(id) on delete set null;
+alter table ilm_certificates add column if not exists score int;
+alter table ilm_certificates add column if not exists total int;
+
+create or replace function ilm__lang(p text) returns text
+language sql immutable as $$
+  select case when p in ('en', 'ml', 'tr', 'ar') then p else 'en' end
+$$;
+
+-- the translated text if there is one, otherwise the English original
+create or replace function ilm__t(p_base text, p_i18n jsonb, p_lang text, p_key text) returns text
+language sql immutable as $$
+  select coalesce(nullif(p_i18n -> p_lang ->> p_key, ''), p_base)
+$$;
+
+-- translated answer choices, only when they line up one-to-one with the originals
+create or replace function ilm__opts(p_options jsonb, p_i18n jsonb, p_lang text) returns jsonb
+language sql immutable as $$
+  select case when jsonb_typeof(p_i18n -> p_lang -> 'options') = 'array'
+               and jsonb_array_length(p_i18n -> p_lang -> 'options') = jsonb_array_length(p_options)
+              then p_i18n -> p_lang -> 'options' else p_options end
+$$;
+
+create or replace function ilm__student_card(s ilm_students, p_fees boolean) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select jsonb_build_object(
+    'id', s.id, 'code', s.code, 'full_name', s.full_name, 'gender', s.gender, 'birth_year', s.birth_year,
+    'level_id', s.level_id, 'class_id', s.class_id, 'parent_name', s.parent_name,
+    'parent_whatsapp', s.parent_whatsapp, 'country', s.country, 'plan', s.plan, 'lang', s.lang,
+    'monthly_fee', s.monthly_fee, 'avatar', s.avatar, 'active', s.active,
+    'parent_token', s.parent_token, 'last_seen', s.last_seen, 'created_at', s.created_at,
+    'stars', (select coalesce(sum(amount), 0) from ilm_stars where student_id = s.id),
+    'lessons_read', (select count(*) from ilm_progress where student_id = s.id and read_at is not null),
+    'lessons_total', (select count(*) from ilm_lessons l join ilm_units u on u.id = l.unit_id
+                       where u.level_id = s.level_id and l.published),
+    'quiz_avg', (select round(avg(best_score * 100.0 / nullif(total, 0)))
+                   from ilm_progress where student_id = s.id and total > 0),
+    'attendance', (select round(100.0 * count(*) filter (where status in ('present','late')) / nullif(count(*), 0))
+                     from ilm_attendance where student_id = s.id),
+    'due', case when p_fees then
+             (select coalesce(sum(amount), 0) from ilm_invoices where student_id = s.id and status = 'due') end
+  )
+$$;
+
+drop function if exists ilm__path(uuid, int);
+create or replace function ilm__path(p_student uuid, p_level int, p_lang text) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+    'id', u.id, 'title', ilm__t(u.title, u.i18n, p_lang, 'title'),
+    'summary', ilm__t(u.summary, u.i18n, p_lang, 'summary'), 'goal', u.goal,
+    'lessons', (select coalesce(jsonb_agg(jsonb_build_object(
+        'id', l.id, 'title', ilm__t(l.title, l.i18n, p_lang, 'title'), 'minutes', l.minutes,
+        'read', pr.read_at is not null, 'passed', pr.passed_at is not null,
+        'best_score', pr.best_score, 'total', pr.total, 'attempts', coalesce(pr.attempts, 0)
+      ) order by l.sort, l.id), '[]'::jsonb)
+      from ilm_lessons l
+      left join ilm_progress pr on pr.lesson_id = l.id and pr.student_id = p_student
+      where l.unit_id = u.id and l.published),
+    'exam', (select jsonb_build_object('best_score', e.best_score, 'total', e.total,
+                    'passed', e.passed_at is not null, 'attempts', e.attempts)
+               from ilm_unit_exams e where e.unit_id = u.id and e.student_id = p_student)
+  ) order by u.sort, u.id), '[]'::jsonb)
+  from ilm_units u where u.level_id = p_level
+$$;
+
+-- certificates with the unit name in the reader's language
+create or replace function ilm__certs(p_student uuid, p_lang text) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'id', c.id, 'title', case when u.id is not null then ilm__t(u.title, u.i18n, p_lang, 'title') else c.title end,
+      'detail', c.detail, 'issued_by', c.issued_by, 'issued_at', c.issued_at,
+      'unit', u.id is not null, 'score', c.score, 'total', c.total) order by c.issued_at desc), '[]'::jsonb)
+    from ilm_certificates c left join ilm_units u on u.id = c.unit_id
+   where c.student_id = p_student
+$$;
+
+create or replace function ilm_admin_save_student(p jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare a ilm_profiles; v_id uuid; v_pin text; v_code text; v_level int; v_class uuid;
+begin
+  a := ilm__admin();
+  if coalesce(trim(p->>'full_name'), '') = '' then raise exception 'Please enter the student''s name.'; end if;
+  v_class := nullif(p->>'class_id', '')::uuid;
+  v_level := coalesce(nullif(p->>'level_id', '')::int, (select level_id from ilm_classes where id = v_class), 1);
+  if nullif(p->>'id', '') is null then
+    v_pin := ilm__new_pin();
+    v_code := ilm__new_code();
+    insert into ilm_students(code, pin_hash, full_name, gender, birth_year, level_id, class_id, parent_name,
+                             parent_whatsapp, country, plan, monthly_fee, parent_token, avatar, lang)
+    values (v_code, crypt(v_pin, gen_salt('bf', 8)), trim(p->>'full_name'), nullif(p->>'gender', ''),
+            nullif(p->>'birth_year', '')::int, v_level, v_class, nullif(trim(p->>'parent_name'), ''),
+            nullif(regexp_replace(coalesce(p->>'parent_whatsapp', ''), '[^0-9+]', '', 'g'), ''),
+            nullif(trim(p->>'country'), ''), nullif(p->>'plan', ''),
+            coalesce(nullif(p->>'monthly_fee', '')::numeric, 0),
+            encode(gen_random_bytes(18), 'hex'), 1 + floor(random() * 8)::int, ilm__lang(p->>'lang'))
+    returning id into v_id;
+  else
+    v_id := (p->>'id')::uuid;
+    update ilm_students set full_name = trim(p->>'full_name'), gender = nullif(p->>'gender', ''),
+           birth_year = nullif(p->>'birth_year', '')::int, level_id = v_level, class_id = v_class,
+           parent_name = nullif(trim(p->>'parent_name'), ''),
+           parent_whatsapp = nullif(regexp_replace(coalesce(p->>'parent_whatsapp', ''), '[^0-9+]', '', 'g'), ''),
+           country = nullif(trim(p->>'country'), ''), plan = nullif(p->>'plan', ''),
+           monthly_fee = coalesce(nullif(p->>'monthly_fee', '')::numeric, 0),
+           lang = case when p ? 'lang' then ilm__lang(p->>'lang') else lang end,
+           active = coalesce((p->>'active')::boolean, true)
+     where id = v_id;
+    if coalesce((p->>'active')::boolean, true) = false then
+      delete from ilm_student_sessions where student_id = v_id;
+    end if;
+  end if;
+  return jsonb_build_object('id', v_id, 'code', coalesce(v_code, (select code from ilm_students where id = v_id)), 'pin', v_pin);
+end $$;
+
+-- the teacher (or admin) chooses a student's language
+create or replace function ilm_staff_set_lang(p_student uuid, p_lang text) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students;
+begin
+  s := ilm__staff_student(p_student);
+  if p_lang not in ('en', 'ml', 'tr', 'ar') then raise exception 'Unknown language.'; end if;
+  update ilm_students set lang = p_lang where id = s.id;
+end $$;
+
+-- ...and the student can change it
+create or replace function ilm_student_lang(p_token text, p_lang text) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students;
+begin
+  s := ilm__student(p_token);
+  if p_lang not in ('en', 'ml', 'tr', 'ar') then raise exception 'Unknown language.'; end if;
+  update ilm_students set lang = p_lang where id = s.id;
+end $$;
+
+create or replace function ilm_staff_student(p_student uuid) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare p ilm_profiles; s ilm_students;
+begin
+  p := ilm__staff();
+  s := ilm__staff_student(p_student);
+  return jsonb_build_object(
+    'student', ilm__student_card(s, p.role = 'admin'),
+    'path', ilm__path(s.id, s.level_id, 'en'),
+    'attempts', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select kind, title, score, total, created_at from ilm_attempts
+         where student_id = s.id order by created_at desc limit 30) x),
+    'assessments', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select id, skill, score, note, teacher_name, created_at from ilm_assessments
+         where student_id = s.id order by created_at desc limit 60) x),
+    'attendance', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select day, status from ilm_attendance where student_id = s.id order by day desc limit 40) x),
+    'homework', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select h.id, h.title, h.due_date, sb.answer, sb.submitted_at, sb.stars, sb.feedback
+          from ilm_homework h left join ilm_submissions sb on sb.homework_id = h.id and sb.student_id = s.id
+         where h.class_id = s.class_id order by h.created_at desc limit 20) x),
+    'stars_log', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select amount, reason, created_at from ilm_stars where student_id = s.id order by created_at desc limit 20) x),
+    'badges', (select coalesce(jsonb_agg(code order by awarded_at), '[]'::jsonb) from ilm_badges where student_id = s.id),
+    'certificates', ilm__certs(s.id, 'en'),
+    'invoices', case when p.role = 'admin' then (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select id, period, description, amount, currency, due_date, status, method, paid_at
+          from ilm_invoices where student_id = s.id order by period desc) x) end
+  );
+end $$;
+
+create or replace function ilm_student_home(p_token text) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students;
+begin
+  s := ilm__student(p_token);
+  update ilm_students set last_seen = now() where id = s.id;
+  return jsonb_build_object(
+    'student', jsonb_build_object('id', s.id, 'code', s.code, 'full_name', s.full_name, 'avatar', s.avatar,
+        'gender', s.gender, 'parent_token', s.parent_token, 'lang', s.lang),
+    'level', (select jsonb_build_object('id', l.id, 'name', l.name, 'arabic', l.arabic,
+        'tagline', ilm__t(l.tagline, l.i18n, s.lang, 'tagline'),
+        'age_min', l.age_min, 'age_max', l.age_max) from ilm_levels l where l.id = s.level_id),
+    'class', (select jsonb_build_object('name', c.name, 'schedule', c.schedule, 'meet_link', c.meet_link,
+        'teacher', (select full_name from ilm_profiles where id = c.teacher_id))
+        from ilm_classes c where c.id = s.class_id and c.active),
+    'stars', (select coalesce(sum(amount), 0) from ilm_stars where student_id = s.id),
+    'badges', (select coalesce(jsonb_agg(code order by awarded_at), '[]'::jsonb) from ilm_badges where student_id = s.id),
+    'units', ilm__path(s.id, s.level_id, s.lang),
+    'homework', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select h.id, h.title, h.details, h.due_date, sb.answer, sb.submitted_at, sb.stars, sb.feedback,
+               sb.reviewed_at is not null as reviewed
+          from ilm_homework h left join ilm_submissions sb on sb.homework_id = h.id and sb.student_id = s.id
+         where h.class_id = s.class_id order by h.created_at desc limit 12) x),
+    'certificates', ilm__certs(s.id, s.lang),
+    'notes', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select skill, score, note, teacher_name, created_at from ilm_assessments
+         where student_id = s.id and note is not null and score >= 4 order by created_at desc limit 3) x),
+    'fees_due', (select count(*) from ilm_invoices where student_id = s.id and status = 'due'),
+    'academy', (select value->>'academy' from ilm_settings where key = 'main')
+  );
+end $$;
+
+create or replace function ilm_student_lesson(p_token text, p_lesson int) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students; l ilm_lessons; u ilm_units;
+begin
+  s := ilm__student(p_token);
+  select * into l from ilm_lessons where id = p_lesson and published;
+  select * into u from ilm_units where id = l.unit_id;
+  if l.id is null or u.level_id is distinct from s.level_id then raise exception 'This lesson is not in your level.'; end if;
+  return jsonb_build_object(
+    'id', l.id, 'unit_id', u.id, 'unit', ilm__t(u.title, u.i18n, s.lang, 'title'),
+    'title', ilm__t(l.title, l.i18n, s.lang, 'title'), 'minutes', l.minutes,
+    'hook', ilm__t(l.hook, l.i18n, s.lang, 'hook'), 'body', ilm__t(l.body, l.i18n, s.lang, 'body'),
+    'arabic', l.arabic, 'translit', l.translit, 'meaning', ilm__t(l.meaning, l.i18n, s.lang, 'meaning'),
+    'action', ilm__t(l.action, l.i18n, s.lang, 'action'),
+    'read', exists (select 1 from ilm_progress where student_id = s.id and lesson_id = l.id and read_at is not null),
+    'questions', (select coalesce(jsonb_agg(jsonb_build_object('id', q.id,
+                    'prompt', ilm__t(q.prompt, q.i18n, s.lang, 'prompt'), 'options', ilm__opts(q.options, q.i18n, s.lang))
+                    order by q.sort, q.id), '[]'::jsonb) from ilm_questions q where q.lesson_id = l.id));
+end $$;
+
+create or replace function ilm_student_exam(p_token text, p_unit int) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students; u ilm_units;
+begin
+  s := ilm__student(p_token);
+  select * into u from ilm_units where id = p_unit;
+  if u.id is null or u.level_id is distinct from s.level_id then raise exception 'This exam is not in your level.'; end if;
+  if exists (select 1 from ilm_lessons l where l.unit_id = u.id and l.published and not exists (
+        select 1 from ilm_progress pr where pr.lesson_id = l.id and pr.student_id = s.id and pr.read_at is not null)) then
+    raise exception 'Finish reading all the lessons in this unit first.';
+  end if;
+  return jsonb_build_object('id', u.id, 'title', ilm__t(u.title, u.i18n, s.lang, 'title'),
+    'questions', (select coalesce(jsonb_agg(jsonb_build_object('id', q.id,
+                    'prompt', ilm__t(q.prompt, q.i18n, s.lang, 'prompt'), 'options', ilm__opts(q.options, q.i18n, s.lang))
+                    order by random()), '[]'::jsonb)
+                    from ilm_questions q join ilm_lessons l on l.id = q.lesson_id
+                   where l.unit_id = u.id and l.published));
+end $$;
+
+create or replace function ilm_student_submit(p_token text, p_kind text, p_ref int, p_answers jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  s ilm_students; v_score int; v_total int; v_results jsonb; v_title text; v_unit ilm_units;
+  v_pass boolean; v_stars int := 0; old_best int; old_passed boolean; v_cert jsonb;
+begin
+  s := ilm__student(p_token);
+  if p_kind = 'lesson' then
+    select l.title into v_title from ilm_lessons l join ilm_units u on u.id = l.unit_id
+     where l.id = p_ref and u.level_id = s.level_id and l.published;
+  elsif p_kind = 'unit' then
+    select * into v_unit from ilm_units where id = p_ref and level_id = s.level_id;
+    v_title := v_unit.title;
+  end if;
+  if v_title is null then raise exception 'This quiz is not in your level.'; end if;
+
+  with qs as (
+    select q.* from ilm_questions q join ilm_lessons l on l.id = q.lesson_id
+     where (p_kind = 'lesson' and q.lesson_id = p_ref) or (p_kind = 'unit' and l.unit_id = p_ref and l.published)
+  )
+  select count(*) filter (where (p_answers->>(id::text))::int = answer), count(*),
+         coalesce(jsonb_agg(jsonb_build_object('id', id, 'answer', answer,
+                  'explain', ilm__t(explain, i18n, s.lang, 'explain'),
+                  'chosen', (p_answers->>(id::text))::int,
+                  'correct', coalesce((p_answers->>(id::text))::int = answer, false))), '[]'::jsonb)
+    into v_score, v_total, v_results from qs;
+  if v_total = 0 then raise exception 'This quiz has no questions yet.'; end if;
+  v_pass := v_score * 3 >= v_total * 2;
+
+  insert into ilm_attempts(student_id, kind, ref_id, title, score, total)
+  values (s.id, p_kind, p_ref, v_title, v_score, v_total);
+
+  if p_kind = 'lesson' then
+    select best_score, passed_at is not null into old_best, old_passed
+      from ilm_progress where student_id = s.id and lesson_id = p_ref;
+    if v_pass and not coalesce(old_passed, false) then v_stars := v_stars + 2; end if;
+    if v_score = v_total and coalesce(old_best, -1) < v_total then v_stars := v_stars + 1; end if;
+    insert into ilm_progress(student_id, lesson_id, read_at, best_score, total, attempts, passed_at)
+    values (s.id, p_ref, now(), v_score, v_total, 1, case when v_pass then now() end)
+    on conflict (student_id, lesson_id) do update set
+      best_score = greatest(coalesce(ilm_progress.best_score, 0), excluded.best_score),
+      total = excluded.total, attempts = ilm_progress.attempts + 1,
+      passed_at = coalesce(ilm_progress.passed_at, excluded.passed_at);
+    if v_stars > 0 then
+      perform ilm__stars(s.id, v_stars, case when v_score = v_total then 'Perfect quiz: ' else 'Quiz passed: ' end || v_title);
+    end if;
+  else
+    select passed_at is not null into old_passed from ilm_unit_exams where student_id = s.id and unit_id = p_ref;
+    insert into ilm_unit_exams(student_id, unit_id, best_score, total, attempts, passed_at, last_at)
+    values (s.id, p_ref, v_score, v_total, 1, case when v_pass then now() end, now())
+    on conflict (student_id, unit_id) do update set
+      best_score = greatest(coalesce(ilm_unit_exams.best_score, 0), excluded.best_score),
+      total = excluded.total, attempts = ilm_unit_exams.attempts + 1,
+      passed_at = coalesce(ilm_unit_exams.passed_at, excluded.passed_at), last_at = now();
+    if v_pass and not coalesce(old_passed, false) then
+      v_stars := 5;
+      perform ilm__stars(s.id, 5, 'Unit exam passed: ' || v_title);
+      insert into ilm_certificates(student_id, title, detail, issued_by, unit_id, score, total)
+      values (s.id, v_title, 'For completing this unit and passing the unit exam with ' || v_score || ' out of ' || v_total || '.',
+              (select value->>'academy' from ilm_settings where key = 'main'), p_ref, v_score, v_total)
+      returning jsonb_build_object('id', id, 'title', title) into v_cert;
+    end if;
+  end if;
+
+  return jsonb_build_object('score', v_score, 'total', v_total, 'passed', v_pass, 'stars', v_stars,
+                            'results', v_results, 'badges', ilm__award_badges(s.id), 'certificate', v_cert);
+end $$;
+
+-- the parent page: in the child's language unless the parent picks another
+drop function if exists ilm_parent_report(text);
+create or replace function ilm_parent_report(p_token text, p_lang text default null) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students; cfg jsonb; v_lang text;
+begin
+  select * into s from ilm_students where parent_token = p_token and length(coalesce(p_token, '')) >= 20;
+  if s.id is null then raise exception 'This report link is not valid. Please ask the academy for a new one.'; end if;
+  select value into cfg from ilm_settings where key = 'main';
+  v_lang := ilm__lang(coalesce(nullif(p_lang, ''), s.lang));
+  return jsonb_build_object(
+    'lang', v_lang,
+    'student', ilm__student_card(s, true) - 'parent_token',
+    'academy', jsonb_build_object('name', cfg->>'academy', 'whatsapp', cfg->>'whatsapp', 'pay_api', cfg->>'pay_api'),
+    'level', (select jsonb_build_object('name', l.name, 'arabic', l.arabic,
+              'tagline', ilm__t(l.tagline, l.i18n, v_lang, 'tagline'),
+              'age_min', l.age_min, 'age_max', l.age_max, 'about', ilm__t(l.about, l.i18n, v_lang, 'about'))
+              from ilm_levels l where l.id = s.level_id),
+    'class', (select jsonb_build_object('name', c.name, 'schedule', c.schedule,
+              'teacher', (select full_name from ilm_profiles where id = c.teacher_id))
+              from ilm_classes c where c.id = s.class_id),
+    'path', ilm__path(s.id, s.level_id, v_lang),
+    'assessments', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select skill, score, note, teacher_name, created_at from ilm_assessments
+         where student_id = s.id order by created_at desc limit 40) x),
+    'attendance', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select day, status from ilm_attendance where student_id = s.id order by day desc limit 24) x),
+    'homework', (select jsonb_build_object('set', count(h.id), 'done', count(sb.student_id))
+        from ilm_homework h left join ilm_submissions sb on sb.homework_id = h.id and sb.student_id = s.id
+       where h.class_id = s.class_id),
+    'badges', (select coalesce(jsonb_agg(code order by awarded_at), '[]'::jsonb) from ilm_badges where student_id = s.id),
+    'certificates', ilm__certs(s.id, v_lang),
+    'invoices', (select coalesce(jsonb_agg(to_jsonb(x)), '[]'::jsonb) from (
+        select id, period, description, amount, currency, due_date, status, method, paid_at
+          from ilm_invoices where student_id = s.id and status in ('due','paid')
+         order by (status = 'due') desc, period desc limit 18) x)
+  );
+end $$;
+
+create or replace function ilm_syllabus() returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+begin
+  perform ilm__staff();
+  return (select coalesce(jsonb_agg(jsonb_build_object(
+      'id', lv.id, 'code', lv.code, 'name', lv.name, 'arabic', lv.arabic, 'age_min', lv.age_min,
+      'age_max', lv.age_max, 'tagline', lv.tagline, 'about', lv.about, 'psychology', lv.psychology, 'i18n', lv.i18n,
+      'units', (select coalesce(jsonb_agg(jsonb_build_object(
+          'id', u.id, 'sort', u.sort, 'title', u.title, 'summary', u.summary, 'goal', u.goal, 'i18n', u.i18n,
+          'lessons', (select coalesce(jsonb_agg(to_jsonb(l) || jsonb_build_object(
+              'questions', (select coalesce(jsonb_agg(to_jsonb(q) order by q.sort, q.id), '[]'::jsonb)
+                              from ilm_questions q where q.lesson_id = l.id)) order by l.sort, l.id), '[]'::jsonb)
+            from ilm_lessons l where l.unit_id = u.id)
+        ) order by u.sort, u.id), '[]'::jsonb) from ilm_units u where u.level_id = lv.id)
+    ) order by lv.id), '[]'::jsonb) from ilm_levels lv);
+end $$;
+
+-- Saving the English lesson keeps the translations of any quiz question that did not change.
+create or replace function ilm_admin_save_lesson(p jsonb) returns int
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_id int; q jsonb; i int := 0; v_old jsonb;
+begin
+  perform ilm__admin();
+  if coalesce(trim(p->>'title'), '') = '' then raise exception 'Please give the lesson a title.'; end if;
+  if nullif(p->>'id', '') is null then
+    insert into ilm_lessons(unit_id, sort, title, minutes, hook, body, arabic, translit, meaning, action, teacher_note, published)
+    values ((p->>'unit_id')::int,
+            coalesce(nullif(p->>'sort', '')::int,
+                     (select coalesce(max(sort), 0) + 1 from ilm_lessons where unit_id = (p->>'unit_id')::int)),
+            trim(p->>'title'), coalesce(nullif(p->>'minutes', '')::int, 8), nullif(trim(p->>'hook'), ''),
+            nullif(trim(p->>'body'), ''), nullif(trim(p->>'arabic'), ''), nullif(trim(p->>'translit'), ''),
+            nullif(trim(p->>'meaning'), ''), nullif(trim(p->>'action'), ''), nullif(trim(p->>'teacher_note'), ''),
+            coalesce((p->>'published')::boolean, true))
+    returning id into v_id;
+  else
+    v_id := (p->>'id')::int;
+    update ilm_lessons set title = trim(p->>'title'), minutes = coalesce(nullif(p->>'minutes', '')::int, 8),
+           hook = nullif(trim(p->>'hook'), ''), body = nullif(trim(p->>'body'), ''),
+           arabic = nullif(trim(p->>'arabic'), ''), translit = nullif(trim(p->>'translit'), ''),
+           meaning = nullif(trim(p->>'meaning'), ''), action = nullif(trim(p->>'action'), ''),
+           teacher_note = nullif(trim(p->>'teacher_note'), ''),
+           published = coalesce((p->>'published')::boolean, true),
+           sort = coalesce(nullif(p->>'sort', '')::int, sort)
+     where id = v_id;
+  end if;
+  if p ? 'questions' then
+    select coalesce(jsonb_object_agg(prompt || '|' || options::text, i18n), '{}'::jsonb) into v_old
+      from ilm_questions where lesson_id = v_id and i18n is not null;
+    delete from ilm_questions where lesson_id = v_id;
+    for q in select * from jsonb_array_elements(p->'questions') loop
+      if coalesce(trim(q->>'prompt'), '') <> '' and jsonb_array_length(q->'options') >= 2 then
+        i := i + 1;
+        insert into ilm_questions(lesson_id, sort, prompt, options, answer, explain, i18n)
+        values (v_id, i, trim(q->>'prompt'), q->'options',
+                least(greatest(coalesce((q->>'answer')::int, 0), 0), jsonb_array_length(q->'options') - 1),
+                nullif(trim(q->>'explain'), ''), v_old -> (trim(q->>'prompt') || '|' || (q->'options')::text));
+      end if;
+    end loop;
+  end if;
+  return v_id;
+end $$;
+
+-- The admin edits one lesson (and its quiz) in one language.
+create or replace function ilm_admin_save_translation(p_lesson int, p_lang text, p jsonb) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare q jsonb;
+begin
+  perform ilm__admin();
+  if p_lang not in ('ml', 'tr', 'ar') then raise exception 'Choose Malayalam, Turkish or Arabic.'; end if;
+  update ilm_lessons set i18n = coalesce(i18n, '{}'::jsonb) || jsonb_build_object(p_lang,
+           jsonb_strip_nulls(jsonb_build_object('title', nullif(trim(p->>'title'), ''), 'hook', nullif(trim(p->>'hook'), ''),
+             'body', nullif(trim(p->>'body'), ''), 'meaning', nullif(trim(p->>'meaning'), ''),
+             'action', nullif(trim(p->>'action'), ''))))
+   where id = p_lesson;
+  for q in select * from jsonb_array_elements(coalesce(p->'questions', '[]'::jsonb)) loop
+    update ilm_questions set i18n = coalesce(i18n, '{}'::jsonb) || jsonb_build_object(p_lang,
+             jsonb_strip_nulls(jsonb_build_object('prompt', nullif(trim(q->>'prompt'), ''),
+               'options', case when jsonb_array_length(q->'options') = jsonb_array_length(options)
+                                and not exists (select 1 from jsonb_array_elements_text(q->'options') o where trim(o) = '')
+                               then q->'options' end,
+               'explain', nullif(trim(q->>'explain'), ''))))
+     where id = (q->>'id')::int and lesson_id = p_lesson;
+  end loop;
+end $$;
+
+-- Installs a whole language pack (the lang-xx.json files that come with the site).
+-- Lessons are matched by their position: level, unit number, lesson number, question number.
+-- By default it only fills gaps, so translations you have corrected yourself are kept.
+create or replace function ilm_admin_load_language(p_lang text, p_data jsonb, p_overwrite boolean default false) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare
+  lv jsonb; un jsonb; le jsonb; qu jsonb; ui int; li int; qi int; v_unit int; v_lesson int; v_q int;
+  n_lessons int := 0; n_questions int := 0; one jsonb;
+begin
+  perform ilm__admin();
+  if p_lang not in ('ml', 'tr', 'ar') then raise exception 'Choose Malayalam, Turkish or Arabic.'; end if;
+  one := jsonb_build_object(p_lang, true);
+  for lv in select * from jsonb_array_elements(p_data->'levels') loop
+    update ilm_levels set i18n = coalesce(i18n, '{}'::jsonb) || jsonb_build_object(p_lang,
+             jsonb_build_object('tagline', lv->>'tagline', 'about', lv->>'about'))
+     where id = (lv->>'id')::int and (p_overwrite or not coalesce(i18n, '{}'::jsonb) ? p_lang);
+    ui := 0;
+    for un in select * from jsonb_array_elements(lv->'units') loop
+      ui := ui + 1;
+      select id into v_unit from (select id, row_number() over (order by sort, id) rn
+                                    from ilm_units where level_id = (lv->>'id')::int) x where rn = ui;
+      continue when v_unit is null;
+      update ilm_units set i18n = coalesce(i18n, '{}'::jsonb) || jsonb_build_object(p_lang,
+               jsonb_build_object('title', un->>'title', 'summary', un->>'summary'))
+       where id = v_unit and (p_overwrite or not coalesce(i18n, '{}'::jsonb) ? p_lang);
+      li := 0;
+      for le in select * from jsonb_array_elements(un->'lessons') loop
+        li := li + 1;
+        select id into v_lesson from (select id, row_number() over (order by sort, id) rn
+                                        from ilm_lessons where unit_id = v_unit) x where rn = li;
+        continue when v_lesson is null;
+        update ilm_lessons set i18n = coalesce(i18n, '{}'::jsonb) || jsonb_build_object(p_lang,
+                 jsonb_strip_nulls(jsonb_build_object('title', le->>'title', 'hook', le->>'hook', 'body', le->>'body',
+                   'meaning', le->>'meaning', 'action', le->>'action')))
+         where id = v_lesson and (p_overwrite or not coalesce(i18n, '{}'::jsonb) ? p_lang);
+        if found then n_lessons := n_lessons + 1; end if;
+        qi := 0;
+        for qu in select * from jsonb_array_elements(le->'questions') loop
+          qi := qi + 1;
+          select id into v_q from (select id, row_number() over (order by sort, id) rn
+                                     from ilm_questions where lesson_id = v_lesson) x where rn = qi;
+          continue when v_q is null;
+          update ilm_questions set i18n = coalesce(i18n, '{}'::jsonb) || jsonb_build_object(p_lang,
+                   jsonb_build_object('prompt', qu->>'prompt', 'options', qu->'options', 'explain', qu->>'explain'))
+           where id = v_q and jsonb_array_length(qu->'options') = jsonb_array_length(options)
+             and (p_overwrite or not coalesce(i18n, '{}'::jsonb) ? p_lang);
+          if found then n_questions := n_questions + 1; end if;
+        end loop;
+      end loop;
+    end loop;
+  end loop;
+  return jsonb_build_object('lessons', n_lessons, 'questions', n_questions);
+end $$;
+
+
+-- =====================================================================
+--  CLASS MEETINGS, REMINDERS, TEACHER PROFILES, TEACHERS ADDING STUDENTS
+--  * Teachers schedule live classes (one-off or weekly) with a meeting link.
+--  * 10 minutes before a class, the Cloudflare Worker sends a phone/computer
+--    notification to the students, parents and the teacher who switched
+--    reminders on.
+--  * Teachers have a profile: photo, email, WhatsApp number, a few words.
+--  * Teachers can add students to their own classes. Fees stay with admin.
+-- =====================================================================
+alter table ilm_profiles add column if not exists photo text;
+alter table ilm_profiles add column if not exists about text;
+alter table ilm_students add column if not exists added_by uuid references ilm_profiles(id) on delete set null;
+
+create table if not exists ilm_meetings (
+  id uuid primary key default gen_random_uuid(),
+  class_id uuid not null references ilm_classes(id) on delete cascade,
+  title text not null default '',
+  starts_at timestamptz not null,
+  minutes int not null default 45 check (minutes between 5 and 300),
+  link text,
+  note text,
+  series uuid,
+  created_by uuid references ilm_profiles(id) on delete set null,
+  created_at timestamptz not null default now(),
+  reminded_at timestamptz
+);
+create index if not exists ilm_meetings_start_idx on ilm_meetings(starts_at);
+create index if not exists ilm_meetings_class_idx on ilm_meetings(class_id, starts_at);
+
+-- browsers that asked for class reminders (Web Push subscriptions)
+create table if not exists ilm_push_subs (
+  endpoint text primary key,
+  p256dh text not null,
+  auth text not null,
+  kind text not null check (kind in ('student','parent','staff')),
+  student_id uuid references ilm_students(id) on delete cascade,
+  profile_id uuid references ilm_profiles(id) on delete cascade,
+  lang text,
+  created_at timestamptz not null default now(),
+  last_sent timestamptz
+);
+create index if not exists ilm_push_student_idx on ilm_push_subs(student_id);
+create index if not exists ilm_push_profile_idx on ilm_push_subs(profile_id);
+
+do $$
+declare t text;
+begin
+  foreach t in array array['ilm_meetings','ilm_push_subs'] loop
+    execute format('alter table public.%I enable row level security', t);
+    execute format('revoke all on table public.%I from anon, authenticated', t);
+  end loop;
+end $$;
+
+-- ------------------------------------------------------------ helpers
+create or replace function ilm__clean_link(p text) returns text
+language plpgsql immutable as $$
+declare v text := nullif(trim(coalesce(p, '')), '');
+begin
+  if v is null then return null; end if;
+  if v !~* '^https?://[^\s<>"]+$' or length(v) > 500 then
+    raise exception 'The meeting link must start with https:// (copy it from Zoom, Google Meet or Jitsi).';
+  end if;
+  return v;
+end $$;
+
+create or replace function ilm__meeting(m ilm_meetings) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select jsonb_build_object(
+    'id', m.id, 'class_id', m.class_id, 'class_name', c.name, 'title', m.title,
+    'starts_at', m.starts_at, 'minutes', m.minutes, 'link', coalesce(m.link, c.meet_link),
+    'own_link', m.link is not null, 'note', m.note, 'series', m.series,
+    'teacher', t.full_name, 'teacher_id', c.teacher_id)
+  from ilm_classes c left join ilm_profiles t on t.id = c.teacher_id
+  where c.id = m.class_id
+$$;
+
+-- the teacher card students and parents see
+create or replace function ilm__teacher_card(p_class uuid) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select jsonb_build_object('name', t.full_name, 'photo', t.photo, 'about', t.about)
+  from ilm_classes c join ilm_profiles t on t.id = c.teacher_id where c.id = p_class
+$$;
+
+-- ------------------------------------------------- staff: profile
+create or replace function ilm_staff_save_profile(p jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare me ilm_profiles; v_photo text;
+begin
+  me := ilm__staff();
+  if coalesce(trim(p->>'full_name'), '') = '' then raise exception 'Please enter your name.'; end if;
+  if length(coalesce(p->>'about', '')) > 400 then raise exception 'Please keep "About me" under 400 letters.'; end if;
+  v_photo := case when p ? 'photo' then nullif(p->>'photo', '') else me.photo end;
+  if v_photo is not null and (length(v_photo) > 80000 or v_photo !~ '^data:image/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$') then
+    raise exception 'That photo could not be used. Please choose a JPG or PNG picture.';
+  end if;
+  update ilm_profiles set
+    full_name = left(trim(p->>'full_name'), 80),
+    phone = nullif(left(regexp_replace(coalesce(p->>'phone', ''), '[^0-9+ ]', '', 'g'), 24), ''),
+    about = nullif(trim(coalesce(p->>'about', '')), ''),
+    photo = v_photo,
+    -- the email always comes from the login itself, never from the form
+    email = coalesce((select email from auth.users where id = me.id), email)
+  where id = me.id returning * into me;
+  return to_jsonb(me);
+end $$;
+
+-- ------------------------------------- staff: teachers add students
+create or replace function ilm_staff_save_student(p jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare me ilm_profiles; c ilm_classes; v_id uuid; v_pin text; v_code text; v_level int; v_fee numeric;
+begin
+  me := ilm__staff();
+  if me.role = 'admin' then return ilm_admin_save_student(p); end if;
+  if coalesce(trim(p->>'full_name'), '') = '' then raise exception 'Please enter the student''s name.'; end if;
+  if nullif(p->>'class_id', '') is null then raise exception 'Please choose one of your classes.'; end if;
+  c := ilm__staff_class((p->>'class_id')::uuid);
+  v_level := coalesce(nullif(p->>'level_id', '')::int, c.level_id, 1);
+  if nullif(p->>'id', '') is null then
+    v_pin := ilm__new_pin();
+    v_code := ilm__new_code();
+    select coalesce((value->'plans'->>c.plan)::numeric, 0) into v_fee from ilm_settings where key = 'main';
+    insert into ilm_students(code, pin_hash, full_name, gender, birth_year, level_id, class_id, parent_name,
+                             parent_whatsapp, country, plan, monthly_fee, parent_token, avatar, lang, added_by)
+    values (v_code, crypt(v_pin, gen_salt('bf', 8)), trim(p->>'full_name'), nullif(p->>'gender', ''),
+            nullif(p->>'birth_year', '')::int, v_level, c.id, nullif(trim(p->>'parent_name'), ''),
+            nullif(regexp_replace(coalesce(p->>'parent_whatsapp', ''), '[^0-9+]', '', 'g'), ''),
+            nullif(trim(p->>'country'), ''), c.plan, coalesce(v_fee, 0),
+            encode(gen_random_bytes(18), 'hex'), 1 + floor(random() * 8)::int, ilm__lang(p->>'lang'), me.id)
+    returning id into v_id;
+  else
+    v_id := (p->>'id')::uuid;
+    perform ilm__staff_student(v_id);          -- must already be in one of this teacher's classes
+    update ilm_students set full_name = trim(p->>'full_name'), gender = nullif(p->>'gender', ''),
+           birth_year = nullif(p->>'birth_year', '')::int, level_id = v_level, class_id = c.id,
+           parent_name = nullif(trim(p->>'parent_name'), ''),
+           parent_whatsapp = nullif(regexp_replace(coalesce(p->>'parent_whatsapp', ''), '[^0-9+]', '', 'g'), ''),
+           country = nullif(trim(p->>'country'), ''),
+           lang = case when p ? 'lang' then ilm__lang(p->>'lang') else lang end
+     where id = v_id;
+  end if;
+  return jsonb_build_object('id', v_id, 'code', coalesce(v_code, (select code from ilm_students where id = v_id)), 'pin', v_pin);
+end $$;
+
+-- teachers keep their own class link and timetable up to date
+create or replace function ilm_staff_save_class_link(p_class uuid, p_schedule text, p_link text) returns void
+language plpgsql security definer set search_path = public, extensions as $$
+declare c ilm_classes;
+begin
+  c := ilm__staff_class(p_class);
+  update ilm_classes set schedule = nullif(trim(coalesce(p_schedule, '')), ''), meet_link = ilm__clean_link(p_link)
+   where id = c.id;
+end $$;
+
+-- ----------------------------------------------- staff: class meetings
+-- p: id (edit) | class_id, title, starts (array of ISO times, one per week), minutes, link, note
+--    scope = 'one' or 'series' when editing a repeating class
+create or replace function ilm_staff_save_meeting(p jsonb) returns int
+language plpgsql security definer set search_path = public, extensions as $$
+declare me ilm_profiles; c ilm_classes; m ilm_meetings; v_series uuid; v_start timestamptz; v_shift interval;
+        v_link text; v_min int; n int := 0; x jsonb;
+begin
+  me := ilm__staff();
+  v_link := ilm__clean_link(p->>'link');
+  v_min := coalesce(nullif(p->>'minutes', '')::int, 45);
+  if v_min < 5 or v_min > 300 then raise exception 'A class can be 5 to 300 minutes long.'; end if;
+
+  if nullif(p->>'id', '') is not null then
+    select * into m from ilm_meetings where id = (p->>'id')::uuid;
+    if m.id is null then raise exception 'This class was not found. It may have been deleted.'; end if;
+    perform ilm__staff_class(m.class_id);
+    v_start := coalesce(nullif(p->>'starts_at', '')::timestamptz, m.starts_at);
+    v_shift := v_start - m.starts_at;
+    update ilm_meetings set title = left(coalesce(trim(p->>'title'), ''), 100), minutes = v_min, link = v_link,
+           note = nullif(left(trim(coalesce(p->>'note', '')), 300), ''),
+           starts_at = starts_at + v_shift,
+           reminded_at = case when v_shift <> interval '0' then null else reminded_at end
+     where id = m.id
+        or (p->>'scope' = 'series' and m.series is not null and series = m.series and starts_at > m.starts_at);
+    get diagnostics n = row_count;
+    return n;
+  end if;
+
+  c := ilm__staff_class(nullif(p->>'class_id', '')::uuid);
+  if jsonb_typeof(p->'starts') <> 'array' or jsonb_array_length(p->'starts') = 0 then
+    raise exception 'Please choose the date and time of the class.';
+  end if;
+  if jsonb_array_length(p->'starts') > 1 then v_series := gen_random_uuid(); end if;
+  for x in select * from jsonb_array_elements(p->'starts') limit 52 loop
+    v_start := (x #>> '{}')::timestamptz;
+    if v_start < now() - interval '1 hour' then raise exception 'That time has already passed. Please choose a time in the future.'; end if;
+    insert into ilm_meetings(class_id, title, starts_at, minutes, link, note, series, created_by)
+    values (c.id, left(coalesce(trim(p->>'title'), ''), 100), v_start, v_min, v_link,
+            nullif(left(trim(coalesce(p->>'note', '')), 300), ''), v_series, me.id);
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+
+create or replace function ilm_staff_delete_meeting(p_id uuid, p_series boolean) returns int
+language plpgsql security definer set search_path = public, extensions as $$
+declare m ilm_meetings; n int;
+begin
+  select * into m from ilm_meetings where id = p_id;
+  if m.id is null then return 0; end if;
+  perform ilm__staff_class(m.class_id);
+  delete from ilm_meetings where id = m.id
+     or (coalesce(p_series, false) and m.series is not null and series = m.series and starts_at > m.starts_at);
+  get diagnostics n = row_count;
+  return n;
+end $$;
+
+create or replace function ilm_staff_meetings(p_days int default 60) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare me ilm_profiles;
+begin
+  me := ilm__staff();
+  return (select coalesce(jsonb_agg(ilm__meeting(m) order by m.starts_at), '[]'::jsonb) from (
+    select m.* from ilm_meetings m join ilm_classes c on c.id = m.class_id
+     where m.starts_at + make_interval(mins => m.minutes) > now()
+       and m.starts_at < now() + make_interval(days => least(greatest(coalesce(p_days, 60), 1), 365))
+       and (me.role = 'admin' or c.teacher_id = me.id)
+     order by m.starts_at limit 400) m);
+end $$;
+
+-- ------------------------------------------ students and parents see
+create or replace function ilm__upcoming(p_class uuid) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select coalesce(jsonb_agg(ilm__meeting(m) - 'teacher_id' order by m.starts_at), '[]'::jsonb) from (
+    select m.* from ilm_meetings m join ilm_classes c on c.id = m.class_id and c.active
+     where m.class_id = p_class and m.starts_at + make_interval(mins => m.minutes) > now()
+     order by m.starts_at limit 8) m
+$$;
+
+create or replace function ilm_student_meetings(p_token text) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students;
+begin
+  s := ilm__student(p_token);
+  return jsonb_build_object('teacher', ilm__teacher_card(s.class_id), 'meetings', ilm__upcoming(s.class_id),
+    'api', (select value->>'pay_api' from ilm_settings where key = 'main'),
+    'reminders', exists (select 1 from ilm_push_subs where student_id = s.id and kind = 'student'));
+end $$;
+
+create or replace function ilm_parent_meetings(p_token text) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students;
+begin
+  select * into s from ilm_students where parent_token = p_token and length(coalesce(p_token, '')) >= 20;
+  if s.id is null then raise exception 'This report link is not valid. Please ask the academy for a new one.'; end if;
+  return jsonb_build_object('teacher', ilm__teacher_card(s.class_id), 'meetings', ilm__upcoming(s.class_id),
+    'api', (select value->>'pay_api' from ilm_settings where key = 'main'));
+end $$;
+
+-- ------------------------------------------------ reminders: sign up
+create or replace function ilm__push_save(p_sub jsonb, p_on boolean, p_kind text, p_student uuid, p_profile uuid, p_lang text) returns boolean
+language plpgsql security definer set search_path = public, extensions as $$
+declare v_end text := p_sub->>'endpoint';
+begin
+  if v_end is null or v_end !~ '^(https://|http://localhost[:/])' or length(v_end) > 1000 then raise exception 'This browser cannot receive reminders.'; end if;
+  if not coalesce(p_on, true) then
+    delete from ilm_push_subs where endpoint = v_end;
+    return false;
+  end if;
+  if coalesce(p_sub->'keys'->>'p256dh', '') = '' or coalesce(p_sub->'keys'->>'auth', '') = '' then
+    raise exception 'This browser cannot receive reminders.';
+  end if;
+  insert into ilm_push_subs(endpoint, p256dh, auth, kind, student_id, profile_id, lang)
+  values (v_end, left(p_sub->'keys'->>'p256dh', 200), left(p_sub->'keys'->>'auth', 100), p_kind, p_student, p_profile, ilm__lang(p_lang))
+  on conflict (endpoint) do update set p256dh = excluded.p256dh, auth = excluded.auth, kind = excluded.kind,
+     student_id = excluded.student_id, profile_id = excluded.profile_id, lang = excluded.lang, created_at = now();
+  return true;
+end $$;
+
+create or replace function ilm_student_push(p_token text, p_sub jsonb, p_on boolean) returns boolean
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students;
+begin
+  s := ilm__student(p_token);
+  return ilm__push_save(p_sub, p_on, 'student', s.id, null, s.lang);
+end $$;
+
+create or replace function ilm_parent_push(p_token text, p_sub jsonb, p_on boolean, p_lang text) returns boolean
+language plpgsql security definer set search_path = public, extensions as $$
+declare s ilm_students;
+begin
+  select * into s from ilm_students where parent_token = p_token and length(coalesce(p_token, '')) >= 20;
+  if s.id is null then raise exception 'This report link is not valid. Please ask the academy for a new one.'; end if;
+  return ilm__push_save(p_sub, p_on, 'parent', s.id, null, coalesce(p_lang, s.lang));
+end $$;
+
+create or replace function ilm_staff_push(p_sub jsonb, p_on boolean) returns boolean
+language plpgsql security definer set search_path = public, extensions as $$
+declare me ilm_profiles;
+begin
+  me := ilm__staff();
+  return ilm__push_save(p_sub, p_on, 'staff', null, me.id, 'en');
+end $$;
+
+-- ------------------------------- reminders: used by the Cloudflare Worker
+-- Classes starting in the next 10 minutes, each with the browsers to remind.
+-- Each class is handed out only once.
+create or replace function ilm_svc_due_meetings() returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare out jsonb;
+begin
+  with due as (
+    update ilm_meetings m set reminded_at = now()
+      from ilm_classes c
+     where c.id = m.class_id and c.active and m.reminded_at is null
+       and m.starts_at > now() and m.starts_at <= now() + interval '10 minutes 30 seconds'
+    returning m.*
+  )
+  select coalesce(jsonb_agg(jsonb_build_object(
+      'id', d.id, 'title', d.title, 'class_name', c.name, 'starts_at', d.starts_at,
+      'link', coalesce(d.link, c.meet_link),
+      'portal', (select value->>'portal_url' from ilm_settings where key = 'main'),
+      'subs', (select coalesce(jsonb_agg(jsonb_build_object(
+                  'endpoint', ps.endpoint, 'p256dh', ps.p256dh, 'auth', ps.auth, 'kind', ps.kind,
+                  'lang', case when ps.kind = 'student' then s.lang else coalesce(ps.lang, 'en') end,
+                  'name', split_part(coalesce(s.full_name, ''), ' ', 1))), '[]'::jsonb)
+               from ilm_push_subs ps left join ilm_students s on s.id = ps.student_id
+              where (ps.student_id is not null and s.class_id = d.class_id and s.active)
+                 or (ps.kind = 'staff' and ps.profile_id = c.teacher_id))
+    )), '[]'::jsonb) into out
+  from due d join ilm_classes c on c.id = d.class_id;
+  return out;
+end $$;
+
+create or replace function ilm_svc_push_done(p_sent text[], p_gone text[]) returns void
+language sql security definer set search_path = public, extensions as $$
+  update ilm_push_subs set last_sent = now() where endpoint = any(coalesce(p_sent, '{}'));
+  delete from ilm_push_subs where endpoint = any(coalesce(p_gone, '{}'));
+$$;
+
+-- one browser, for the "send me a test" button
+create or replace function ilm_svc_push_sub(p_endpoint text) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select jsonb_build_object('endpoint', ps.endpoint, 'p256dh', ps.p256dh, 'auth', ps.auth, 'kind', ps.kind,
+           'lang', case when ps.kind = 'student' then s.lang else coalesce(ps.lang, 'en') end,
+           'name', split_part(coalesce(s.full_name, ''), ' ', 1),
+           'portal', (select value->>'portal_url' from ilm_settings where key = 'main'))
+    from ilm_push_subs ps left join ilm_students s on s.id = ps.student_id
+   where ps.endpoint = p_endpoint
+$$;
+
+-- The Worker's signing key for reminders (VAPID). Created once by the Worker,
+-- kept here so it never changes; only the Worker (service key) can read it.
+create or replace function ilm_svc_vapid(p_new jsonb) returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare v jsonb;
+begin
+  select value into v from ilm_settings where key = 'vapid';
+  if v is null and p_new is not null then
+    insert into ilm_settings(key, value) values ('vapid', p_new) on conflict (key) do nothing;
+    select value into v from ilm_settings where key = 'vapid';
+  end if;
+  return v;
+end $$;
+
+-- ------------------------------------------- updated staff functions
+create or replace function ilm__student_card(s ilm_students, p_fees boolean) returns jsonb
+language sql stable security definer set search_path = public, extensions as $$
+  select jsonb_build_object(
+    'id', s.id, 'code', s.code, 'full_name', s.full_name, 'gender', s.gender, 'birth_year', s.birth_year,
+    'level_id', s.level_id, 'class_id', s.class_id, 'parent_name', s.parent_name,
+    'parent_whatsapp', s.parent_whatsapp, 'country', s.country, 'plan', s.plan, 'lang', s.lang,
+    'monthly_fee', s.monthly_fee, 'avatar', s.avatar, 'active', s.active, 'added_by', s.added_by,
+    'parent_token', s.parent_token, 'last_seen', s.last_seen, 'created_at', s.created_at,
+    'stars', (select coalesce(sum(amount), 0) from ilm_stars where student_id = s.id),
+    'lessons_read', (select count(*) from ilm_progress where student_id = s.id and read_at is not null),
+    'lessons_total', (select count(*) from ilm_lessons l join ilm_units u on u.id = l.unit_id
+                       where u.level_id = s.level_id and l.published),
+    'quiz_avg', (select round(avg(best_score * 100.0 / nullif(total, 0)))
+                   from ilm_progress where student_id = s.id and total > 0),
+    'attendance', (select round(100.0 * count(*) filter (where status in ('present','late')) / nullif(count(*), 0))
+                     from ilm_attendance where student_id = s.id),
+    'due', case when p_fees then
+             (select coalesce(sum(amount), 0) from ilm_invoices where student_id = s.id and status = 'due') end
+  )
+$$;
+
+create or replace function ilm_staff_bootstrap() returns jsonb
+language plpgsql security definer set search_path = public, extensions as $$
+declare p ilm_profiles; adm boolean;
+begin
+  p := ilm__staff();
+  adm := p.role = 'admin';
+  return jsonb_build_object(
+    'me', to_jsonb(p),
+    'settings', (select value from ilm_settings where key = 'main'),
+    'levels', (select coalesce(jsonb_agg(to_jsonb(l) - 'i18n' - 'psychology' order by l.id), '[]'::jsonb) from ilm_levels l),
+    'teachers', (select coalesce(jsonb_agg(jsonb_build_object(
+        'id', t.id, 'full_name', t.full_name, 'email', case when adm or t.id = p.id then t.email end,
+        'phone', case when adm or t.id = p.id then t.phone end, 'photo', t.photo, 'about', t.about,
+        'role', t.role, 'approved', t.approved, 'created_at', t.created_at) order by t.created_at), '[]'::jsonb)
+      from ilm_profiles t where adm or t.approved),
+    'classes', (select coalesce(jsonb_agg(jsonb_build_object(
+        'id', c.id, 'name', c.name, 'level_id', c.level_id, 'teacher_id', c.teacher_id, 'plan', c.plan,
+        'schedule', c.schedule, 'meet_link', c.meet_link, 'active', c.active,
+        'students', (select count(*) from ilm_students s where s.class_id = c.id and s.active)
+      ) order by c.created_at), '[]'::jsonb)
+      from ilm_classes c where adm or c.teacher_id = p.id),
+    'students', (select coalesce(jsonb_agg(ilm__student_card(s, adm) order by s.full_name), '[]'::jsonb)
+      from ilm_students s
+      where adm or exists (select 1 from ilm_classes c where c.id = s.class_id and c.teacher_id = p.id)),
+    'homework_to_review', (select count(*) from ilm_submissions sb
+        join ilm_homework h on h.id = sb.homework_id join ilm_classes c on c.id = h.class_id
+       where sb.reviewed_at is null and (adm or c.teacher_id = p.id)),
+    'meetings', ilm_staff_meetings(60),
+    'reminders', (select count(*) from ilm_push_subs where profile_id = p.id),
+    'fees', case when adm then (select jsonb_build_object(
+        'due_total', coalesce(sum(amount) filter (where status = 'due'), 0),
+        'due_count', count(*) filter (where status = 'due'),
+        'overdue_count', count(*) filter (where status = 'due' and due_date < current_date),
+        'paid_this_month', coalesce(sum(amount) filter (where status = 'paid'
+              and paid_at >= date_trunc('month', now())), 0)) from ilm_invoices) end
+  );
+end $$;
+-- ------------------------------------------------------------ permissions
+do $$
+declare f record;
+begin
+  for f in select p.oid::regprocedure as sig, p.proname from pg_proc p
+            join pg_namespace n on n.oid = p.pronamespace
+           where n.nspname = 'public' and p.proname like 'ilm\_%' loop
+    execute format('revoke all on function %s from public, anon, authenticated', f.sig);
+    if f.proname like 'ilm\_\_%' then
+      null;                                                   -- internal helpers: nobody
+    elsif f.proname like 'ilm\_pay\_%' or f.proname like 'ilm\_svc\_%' then
+      execute format('grant execute on function %s to service_role', f.sig);
+    elsif f.proname like 'ilm\_student\_%' or f.proname like 'ilm\_parent\_%' then
+      execute format('grant execute on function %s to anon, authenticated', f.sig);
+    else
+      execute format('grant execute on function %s to authenticated', f.sig);
+    end if;
+  end loop;
+end $$;
 
 -- Done. You should see: Success. No rows returned.

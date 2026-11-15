@@ -53,10 +53,13 @@ Upload ALL files from this folder and commit. GitHub replaces the old
 ones with the same name.
 
   New files:      portal.html  portal.css  portal.js  portal-staff.js
-                  portal-config.js  supabase.js  supabase-setup.sql
-                  PORTAL-SETUP.txt
-  Changed files:  worker.js  index.html  fees.html  styles.css
-                  firebase.json
+                  portal-i18n.js  portal-config.js  supabase.js
+                  lang-ml.json  lang-tr.json  lang-ar.json
+                  sw.js  manifest.webmanifest  icon-192.png  icon-512.png
+                  icon-badge.png  apple-touch-icon.png
+                  supabase-setup.sql  PORTAL-SETUP.txt
+  Changed files:  worker.js  wrangler.jsonc  index.html  fees.html
+                  styles.css  firebase.json
 
 Cloudflare rebuilds the Worker by itself after the commit.
 
@@ -131,12 +134,80 @@ Until you finish this part everything else works; parents simply see
      RAZORPAY_WEBHOOK_SECRET
 
 
+PART 5 — LANGUAGES (English, Malayalam, Turkish, Arabic)       5 minutes
+---------------------------------------------------------------------
+The lessons, quizzes, exams, the student pages and the parent page are
+available in four languages. The teacher dashboard stays in English.
+
+If your portal was set up BEFORE the languages were added, do these two
+things first, in this order:
+
+  a) Supabase > SQL Editor: paste the NEW supabase-setup.sql and Run.
+     (Safe: it only adds what is missing. Nothing is deleted.)
+  b) Upload the new website files (Part 2). The three language files
+     lang-ml.json, lang-tr.json and lang-ar.json must be uploaded too.
+
+Then install the translations, once:
+
+1. Sign in as admin > Syllabus > open "Languages".
+2. Press "Install" next to Malayalam, Turkish and Arabic.
+   Each one adds 54 lessons and 162 quiz questions.
+
+How the language is chosen:
+  * Admin: "Lesson language" when adding or editing a student.
+  * Teacher: the language box at the top of the student's page.
+  * Student: the globe button at the top of their page, any time.
+  * Parent: the globe button on the parent page. This changes only
+    what the parent sees, not the child's lessons.
+  * A lesson that has no translation is shown in English.
+
+To correct a translation: Syllabus > open a lesson > choose the
+language > "Edit translation". Your corrections are kept even if you
+press "Install" again. Please ask a teacher who speaks each language to
+read the lessons once.
+
+
+PART 6 — LIVE CLASSES AND REMINDERS                            5 minutes
+---------------------------------------------------------------------
+Teachers schedule their live classes in the portal (Schedule > Schedule
+a class): date, time, length, repeat every week, and the meeting link
+(the class link, a pasted Zoom / Google Meet link, or a free Jitsi Meet
+room made with one tap). Students and parents see the next class with a
+Join button and a countdown, in their own time zone.
+
+10 minutes before each class a notification goes to every phone or
+computer where reminders were switched on (the bell row on the student
+page, the parent page and the teacher's Schedule page).
+
+To switch this on:
+  a) Supabase > SQL Editor: paste the NEW supabase-setup.sql and Run.
+  b) Upload all files to GitHub (Part 2). The new wrangler.jsonc tells
+     Cloudflare to run the Worker once a minute to send the reminders.
+     Nothing else to add: the Worker uses the SUPABASE secrets you
+     already have and makes its own reminder key the first time.
+  c) Deploy to Firebase (Part 2).
+  d) Teacher: Schedule > "Turn on" > "Send a test". A notification
+     should appear within a few seconds.
+
+Good to know:
+  * Android, Windows and Mac: works in Chrome, Edge, Firefox, Safari.
+  * iPhone / iPad (iOS 16.4 or newer): open the portal in Safari, tap
+    Share > "Add to Home Screen", open the portal from that icon, then
+    switch reminders on. The portal explains this on the phone.
+  * Free Jitsi rooms (meet.jit.si) end after 95 minutes. The first person
+    to open the room may be asked to sign in with Google, GitHub or
+    Facebook, so the teacher should open it a few minutes early.
+
+
 HOW TO USE IT DAY TO DAY
 ---------------------------------------------------------------------
 Admin
   Classes    create a class: level, teacher, timetable, Zoom/Meet link
   Students   "Add student" creates the Student ID and PIN. One tap sends
-             them, with the private parent link, to the parent's WhatsApp
+             them, with the private parent link, to the parent's WhatsApp.
+             Teachers can add students to their own classes too; the
+             fee comes from the class plan and you see a "Check fee"
+             note on Home
   Teachers   teachers sign up themselves; you approve them here
   Fees       each month press "Create fees for <month>". Press "Remind"
              to send a WhatsApp reminder with the pay link. Online
@@ -146,6 +217,10 @@ Admin
   Settings   prices, currency, WhatsApp number, data downloads
 
 Teacher
+  Home shows the next class with a Start button. Schedule: live classes,
+  meeting links and reminders. Students: add a student to your class.
+  My profile (tap your name or photo): photo, email, WhatsApp number,
+  a few words for parents, password.
   Attendance, homework (set, read answers, give stars), and on each
   student's page: assessment marks 1–5 with a note for the parent,
   bonus stars, certificates, new PIN, parent link.
