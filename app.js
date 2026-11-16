@@ -127,6 +127,8 @@
         website: data.website || '', page: location.pathname, at: new Date().toISOString()
       };
       saveLead(lead);
+      // Meta Pixel (ILM's own pixel, see pixel.js): counts the registration for the ads
+      if (window.ilmTrack) window.ilmTrack('Lead', { content_name: 'Registration form', content_category: lead.language });
 
       var done = function () { location.href = 'fees.html'; };
       var timer = setTimeout(done, 4000);
@@ -159,6 +161,7 @@
       a.href = waLink(msg);
       a.target = '_blank';
       a.rel = 'noopener';
+      a.addEventListener('click', function () { if (window.ilmTrack) window.ilmTrack('Contact', { content_name: plan.name }); });
     });
   }
 
